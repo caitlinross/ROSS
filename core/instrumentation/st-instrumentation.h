@@ -5,7 +5,7 @@
  * Header file for all of the ROSS instrumentation
  */
 
-#include <ross.h>
+#include "ross.h"
 #include <inttypes.h>
 
 #define INST_MAX_LENGTH 4096

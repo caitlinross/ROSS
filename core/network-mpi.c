@@ -1,4 +1,4 @@
-#include <ross.h>
+#include "ross.h"
 #include <mpi.h>
 
 MPI_Comm MPI_COMM_ROSS = MPI_COMM_WORLD;

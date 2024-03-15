@@ -1,5 +1,5 @@
-PROJECT(ROSS_TOP C)
 CMAKE_MINIMUM_REQUIRED(VERSION 3.5)
+PROJECT(ROSS C)
 
 SET(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
@@ -8,13 +8,17 @@ SET(CMAKE_POSITION_INDEPENDENT_CODE ON)
 ENABLE_TESTING()
 INCLUDE(CTest)
 
-LIST(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/core/cmake/")
+LIST(INSERT CMAKE_MODULE_PATH 0 "${CMAKE_CURRENT_SOURCE_DIR}/cmake/")
 
+########################
+#TODO I'm unsure about some of this stuff, causes some weird issues when installing on mac arm
+# if I make cmake changes and try to reinstall, I get an error, so I have to wipe out the install dir first
+# which shouldn't be necessary...
 # Follow section based on Spack doc: 
 # https://spack.readthedocs.io/en/latest/workflows.html#write-the-cmake-build
 # enable @rpath in the install name for any shared library being built
 # note: it is planned that a future version of CMake will enable this by default
-set(CMAKE_MACOSX_RPATH 1)
+#set(CMAKE_MACOSX_RPATH 1)
 
 # Always use full RPATH
 # http://www.cmake.org/Wiki/CMake_RPATH_handling
@@ -38,6 +42,18 @@ IF("${isSystemDir}" STREQUAL "-1")
 ENDIF("${isSystemDir}" STREQUAL "-1")
 
 # end of spack-related addition
+#########################
+
+# add a default build type
+set(default_build_type "Release")
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  message(STATUS "Setting build type to '${default_build_type}' as none was specified.")
+  set(CMAKE_BUILD_TYPE "${default_build_type}" CACHE
+      STRING "Choose the type of build." FORCE)
+  # Set the possible values of build type for cmake-gui
+  set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS
+    "Debug" "Release" "MinSizeRel" "RelWithDebInfo")
+endif()
 
 # We probably don't want this to run on every build.
 option(COVERALLS "Generate coveralls data" OFF)

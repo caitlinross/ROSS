@@ -1,4 +1,4 @@
-#include <ross.h>
+#include "ross.h"
 #include <assert.h>
 
 static inline void link_causality (tw_event *nev, tw_event *cev) {

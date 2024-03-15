@@ -1,5 +1,5 @@
 #include <ctype.h>
-#include <ross.h>
+#include "ross.h"
 
 static const char *program;
 static const tw_optdef *all_groups[10];

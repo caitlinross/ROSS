@@ -1,70 +1,41 @@
-PROJECT(ROSS C)
-INCLUDE_DIRECTORIES(${ROSS_SOURCE_DIR} ${ROSS_BINARY_DIR})
-
 SET(ross_srcs
+  ross-random.c
+  rand-${RAND}.c
+  network-${NETWORK}.c
+  hash-quadratic.c
+  buddy.c
+  lz4.c
+  tw-state.c
+  ross-global.c
+  tw-event.c
+  tw-opts.c
+  tw-pe.c
+  tw-kp.c
+  tw-lp.c
+  tw-timing.c
+  tw-sched.c
+  tw-setup.c
+  tw-stats.c
+  tw-util.c
+)
 
-queue/tw-queue.h
-queue/${QUEUE}.c
-
-ross-random.h
-ross-random.c
-rand-${RAND}.h
-rand-${RAND}.c
-
-clock/${CLOCK}.h
-clock/${CLOCK}.c
-
-ross-gvt.h
-gvt/${GVT}.h
-gvt/${GVT}.c
-
-network-${NETWORK}.h
-network-${NETWORK}.c
-
-hash-quadratic.h
-hash-quadratic.c
-
-buddy.h
-buddy.c
-lz4.h
-lz4.c
-tw-state.c
-
-ross-extern.h
-ross-global.c
-
-ross-inline.h
-ross-kernel-inline.h
-ross.h
-ross-types.h
-
-tw-eventq.h
-tw-event.c
-
-tw-opts.h
-tw-opts.c
-
-tw-pe.c
-tw-kp.c
-tw-lp.c
-
-tw-timing.h
-tw-timing.c
-
-tw-sched.c
-tw-setup.c
-tw-stats.c
-tw-util.c
-
-instrumentation/st-instrumentation.h
-instrumentation/st-instrumentation.c
-instrumentation/st-stats-buffer.c
-instrumentation/st-sim-engine.c
-instrumentation/st-event-trace.c
-instrumentation/st-model-data.c
-instrumentation/ross-lps/analysis-lp.h
-instrumentation/ross-lps/analysis-lp.c
-instrumentation/ross-lps/specialized-lps.c)
+set(ross_headers
+  ross-random.h
+  rand-${RAND}.h
+  ross-gvt.h
+  network-${NETWORK}.h
+  hash-quadratic.h
+  buddy.h
+  lz4.h
+  ross-extern.h
+  ross-inline.h
+  ross-kernel-inline.h
+  ross.h
+  ross-types.h
+  tw-eventq.h
+  tw-opts.h
+  tw-timing.h
+)
 
 # ROSS VERSION INFORMATION
 ## Print Date and Time at top of ROSS output
@@ -85,25 +56,29 @@ git_describe_working_tree(VERSION --tags --dirty)
 message(STATUS "ROSS VERSION=${VERSION}")
 
 #parse the version information into pieces.
-string(REGEX REPLACE "^v([0-9]+)\\..*" "\\1" VERSION_MAJOR "${VERSION}")
-string(REGEX REPLACE "^v[0-9]+\\.([0-9]+).*" "\\1" VERSION_MINOR "${VERSION}")
-string(REGEX REPLACE "^v[0-9]+\\.[0-9]+\\.([0-9]+).*" "\\1" VERSION_PATCH "${VERSION}")
-string(REGEX REPLACE "^v[0-9]+\\.[0-9]+\\.[0-9]+(.*)" "\\1" VERSION_SHA1 "${VERSION}")
+string(REGEX REPLACE "^v([0-9]+)\\..*" "\\1" ROSS_VERSION_MAJOR "${VERSION}")
+string(REGEX REPLACE "^v[0-9]+\\.([0-9]+).*" "\\1" ROSS_VERSION_MINOR "${VERSION}")
+string(REGEX REPLACE "^v[0-9]+\\.[0-9]+\\.([0-9]+).*" "\\1" ROSS_VERSION_PATCH "${VERSION}")
+string(REGEX REPLACE "^v[0-9]+\\.[0-9]+\\.[0-9]+(.*)" "\\1" ROSS_VERSION_SHA1 "${VERSION}")
 # VERSION_SHORT used in the ross.pc file
-set(VERSION_SHORT "${VERSION_MAJOR}.${VERSION_MINOR}.${VERSION_PATCH}")
+set(ROSS_VERSION_SHORT "${ROSS_VERSION_MAJOR}.${ROSS_VERSION_MINOR}.${ROSS_VERSION_PATCH}")
 
 
 # Data Structure for remote Events
 # If AVL_TREE is OFF, ROSS reverts to hashing
 OPTION(AVL_TREE "Use AVL trees for optimistic mode events? (hash tables otherwise)" ON)
 IF(AVL_TREE)
-  SET(ross_srcs ${ross_srcs} avl_tree.h avl_tree.c)
+  list(APPEND ross_srcs avl_tree.c)
+  list(APPEND ross_headers avl_tree.h)
 ENDIF(AVL_TREE)
 
 # RIO: Restart IO
 OPTION(USE_RIO "Enable RIO checkpointing library?" OFF)
 IF(USE_RIO)
-  SET(ross_srcs ${ross_srcs} rio/io-mpi.c rio/io-serialize.c)
+  list(APPEND ross_srcs
+    rio/io-mpi.c
+    rio/io-serialize.c
+  )
   INCLUDE_DIRECTORIES(rio)
 ENDIF(USE_RIO)
 
@@ -112,7 +87,7 @@ OPTION(USE_DAMARIS "Build with Damaris library (for in situ vis/analysis)?" OFF)
 if (USE_DAMARIS)
     ADD_SUBDIRECTORY(risa)
     INCLUDE_DIRECTORIES(${DAMARIS_INCLUDE})
-    SET(ross_srcs ${ross_srcs} ${ROSS_Damaris_SOURCE_DIR}/core/damaris.h)
+    list(APPEND ross_headers ${ROSS_Damaris_SOURCE_DIR}/core/damaris.h)
 ENDIF(USE_DAMARIS)
 
 # Use deterministic unbiased RNG tiebreaker for event ties
@@ -141,9 +116,14 @@ SET(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -DROSS_OPTION_LIST='\"${OPTIONS}\"'")
 OPTION(ROSS_BUILD_SHARED_LIBS "Build shared libraries instead of static" OFF)
 SET(BUILD_SHARED_LIBS ${ROSS_BUILD_SHARED_LIBS})
 ADD_LIBRARY(ROSS ${ross_srcs})
+add_library(ROSS::ross ALIAS ROSS)
 SET_TARGET_PROPERTIES(ROSS PROPERTIES OUTPUT_NAME ROSS)
-TARGET_LINK_LIBRARIES(ROSS ${ROSS_EXTERNAL_LIBS})
-TARGET_INCLUDE_DIRECTORIES(ROSS INTERFACE ${MPI_C_INCLUDE_PATH})
+TARGET_LINK_LIBRARIES(ROSS PUBLIC ${ROSS_EXTERNAL_LIBS})
+#TARGET_INCLUDE_DIRECTORIES(ROSS INTERFACE ${MPI_C_INCLUDE_PATH})
+TARGET_INCLUDE_DIRECTORIES(ROSS
+  PUBLIC $<BUILD_INTERFACE:${ROSS_SOURCE_DIR}/core>
+         $<BUILD_INTERFACE:${ROSS_BINARY_DIR}/core>
+         $<INSTALL_INTERFACE:include>)
 
 if (COVERALLS)
     set(COVERAGE_SRCS ${ross_srcs})
@@ -157,27 +137,67 @@ if (COVERALLS)
 
 endif()
 
+add_subdirectory(clock)
+add_subdirectory(gvt)
+add_subdirectory(instrumentation)
+add_subdirectory(queue)
+#TODO need to appropriately handle with risa and rio
+
+#-------------------------------------------------------------------------------
+# installation
+
+include (GNUInstallDirs)
+set(INSTALL_CONFIGDIR ${CMAKE_INSTALL_LIBDIR}/cmake/ROSS)
+
+install(TARGETS ROSS
+  EXPORT ROSS-targets
+  LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+  ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+
+install(EXPORT ROSS-targets
+    FILE ROSS-targets.cmake
+  NAMESPACE ROSS::
+  DESTINATION ${INSTALL_CONFIGDIR})
+
+# generate the config file that includes the exports
+include(CMakePackageConfigHelpers)
+write_basic_package_version_file(
+    ${ROSS_BINARY_DIR}/ROSSConfigVersion.cmake
+    VERSION ${ROSS_VERSION_SHORT}
+    COMPATIBILITY AnyNewerVersion
+)
+
+configure_package_config_file(${ROSS_SOURCE_DIR}/cmake/Config.cmake.in
+  "${ROSS_BINARY_DIR}/ROSSConfig.cmake"
+  INSTALL_DESTINATION ${INSTALL_CONFIGDIR}
+  )
+install(FILES
+  "${ROSS_BINARY_DIR}/ROSSConfig.cmake"
+  "${ROSS_BINARY_DIR}/ROSSConfigVersion.cmake"
+  DESTINATION ${INSTALL_CONFIGDIR})
+
+export(EXPORT ROSS-targets
+    FILE ${CMAKE_CURRENT_BINARY_DIR}/ROSS-targets.cmake
+    NAMESPACE ROSS::)
+
+install(FILES ${ross_headers} DESTINATION include)
+
+
 # Build Specific Config Header
-CONFIGURE_FILE(config.h.in config.h)
-SET(ross_srcs ${ross_srcs} config.h)
-SET_SOURCE_FILES_PROPERTIES(${CMAKE_CURRENT_SOURCE_DIR}/config.h.in PROPERTIES GENERATED FALSE)
+CONFIGURE_FILE(config.h.in ${CMAKE_CURRENT_BINARY_DIR}/config.h)
 SET_SOURCE_FILES_PROPERTIES(${CMAKE_CURRENT_BINARY_DIR}/config.h PROPERTIES GENERATED TRUE)
 
 
-# CODES config bin
+## CODES config bin
 SET(ROSS_CC $ENV{CC})
 SET(ROSS_CXX $ENV{CXX})
-CONFIGURE_FILE(ross-config.in ross-config @ONLY)
-CONFIGURE_FILE(ross.pc.in ross.pc @ONLY)
-SET_SOURCE_FILES_PROPERTIES(${CMAKE_CURRENT_SOURCE_DIR}/ross.pc.in PROPERTIES GENERATED FALSE)
+CONFIGURE_FILE(ross-config.in ${CMAKE_CURRENT_BINARY_DIR}/ross-config @ONLY)
+CONFIGURE_FILE(ross.pc.in ${CMAKE_CURRENT_BINARY_DIR}/ross.pc @ONLY)
 SET_SOURCE_FILES_PROPERTIES(${CMAKE_CURRENT_BINARY_DIR}/ross.pc PROPERTIES GENERATED TRUE)
 
 
-# Make Install
-INSTALL(FILES ${ROSS_BINARY_DIR}/ross-config DESTINATION bin PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)
-INSTALL(FILES ${ROSS_BINARY_DIR}/config.h DESTINATION include)
-INSTALL(DIRECTORY ${ROSS_SOURCE_DIR}/ DESTINATION include FILES_MATCHING PATTERN "*.h")
-INSTALL(TARGETS ROSS EXPORT ROSS-targets DESTINATION lib)
-INSTALL(EXPORT ROSS-targets DESTINATION lib)
-INSTALL(FILES ROSSConfig.cmake DESTINATION lib)
-INSTALL(FILES ${ROSS_BINARY_DIR}/ross.pc DESTINATION lib/pkgconfig)
+## Make Install
+INSTALL(FILES ${CMAKE_CURRENT_BINARY_DIR}/ross-config DESTINATION bin PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)
+INSTALL(FILES ${CMAKE_CURRENT_BINARY_DIR}/config.h DESTINATION include)
+#INSTALL(DIRECTORY ${ROSS_SOURCE_DIR}/ DESTINATION include FILES_MATCHING PATTERN "*.h")
+INSTALL(FILES ${CMAKE_CURRENT_BINARY_DIR}/ross.pc DESTINATION lib/pkgconfig)
