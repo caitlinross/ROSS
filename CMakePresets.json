@@ -1,0 +1,47 @@
+{
+    "version": 8,
+    "cmakeMinimumRequired": {
+        "major": 3,
+        "minor": 28,
+        "patch": 1
+    },
+    "configurePresets": [
+        {
+            "name": "ross-debug",
+            "description": "Debug build using Ninja",
+            "hidden": false,
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/build/debug",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug",
+                "CMAKE_INSTALL_PREFIX": "${sourceDir}/install/debug",
+                "BUILD_TESTING": "ON"
+            }
+        },
+        {
+            "name": "ross-release",
+            "hidden": false,
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/build/release",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "CMAKE_INSTALL_PREFIX": "${sourceDir}/install/release",
+                "BUILD_TESTING": "ON"
+            }
+        }
+    ],
+    "buildPresets": [
+        {
+            "name": "ross-debug",
+            "configurePreset": "ross-debug",
+            "description": "Build using the debug configuration",
+            "hidden": false
+        },
+        {
+            "name": "ross-release",
+            "configurePreset": "ross-release",
+            "description": "Build using the release configuration",
+            "hidden": false
+        }
+    ]
+}
