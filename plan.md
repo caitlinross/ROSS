@@ -132,18 +132,39 @@ The plan is ordered: do the export-system changes first (steps 1–6), then qual
 **Change**:
 ```cmake
 cmake_minimum_required(VERSION 3.21)   # 3.21+ gives us PROJECT_IS_TOP_LEVEL
+
+# Must run git-describe BEFORE project() so we can pass VERSION in.
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/core/cmake/")
+include(GetGitRevisionDescription)
+git_describe_working_tree(ROSS_GIT_DESCRIBE --tags --dirty)
+
+string(REGEX REPLACE "^v([0-9]+)\\..*"              "\\1" ROSS_VERSION_MAJOR "${ROSS_GIT_DESCRIBE}")
+string(REGEX REPLACE "^v[0-9]+\\.([0-9]+).*"        "\\1" ROSS_VERSION_MINOR "${ROSS_GIT_DESCRIBE}")
+string(REGEX REPLACE "^v[0-9]+\\.[0-9]+\\.([0-9]+).*" "\\1" ROSS_VERSION_PATCH "${ROSS_GIT_DESCRIBE}")
+set(ROSS_DETECTED_VERSION "${ROSS_VERSION_MAJOR}.${ROSS_VERSION_MINOR}.${ROSS_VERSION_PATCH}")
+
+# Fallback for tarball / shallow-clone / no-tag builds. project(VERSION ...) errors
+# on a malformed version string, so we can't pass empty/garbage through.
+if(NOT ROSS_DETECTED_VERSION MATCHES "^[0-9]+\\.[0-9]+\\.[0-9]+$")
+    message(WARNING "Could not derive ROSS version from git (got '${ROSS_GIT_DESCRIBE}'); "
+                    "falling back to 0.0.0. Set -DROSS_DETECTED_VERSION=X.Y.Z to override.")
+    set(ROSS_DETECTED_VERSION "0.0.0")
+endif()
+
 project(ross
-    VERSION ${ROSS_DETECTED_VERSION}   # set after running git-describe
+    VERSION ${ROSS_DETECTED_VERSION}
     DESCRIPTION "Rensselaer's Optimistic Simulation System"
     HOMEPAGE_URL "https://github.com/ROSS-org/ROSS"
     LANGUAGES C)
 ```
 
-Move the `git_describe` block from `core/CMakeLists.txt` up to the top-level so we can pass `VERSION` into `project()`. Set `ROSS_DETECTED_VERSION` to `${VERSION_MAJOR}.${VERSION_MINOR}.${VERSION_PATCH}` derived from the git describe.
+Keep the original `VERSION_SHA1` extraction (for embedding into `config.h`) but do it after `project()` — only the numeric parts are fed into `project()`.
 
 Lower-case `ross` as the project name is the modern convention (the package name `find_package(ross)` is then case-insensitive by spec but consistent). It also lets `${ross_VERSION}`, `${ross_VERSION_MAJOR}`, etc. flow naturally from `project()`.
 
 **Why**: enables `PROJECT_IS_TOP_LEVEL`, modern `install(TARGETS ... FILE_SET HEADERS)` (3.23+) if we want it, `target_link_libraries(... PRIVATE MPI::MPI_C)` clean semantics, and lets the package-version file be auto-generated.
+
+**Regression risk to watch**: `git_describe_working_tree` returns empty on tarball builds / shallow clones / tag-less trees. The current code tolerates empty version strings (they just leak into `ross.pc` as blanks); `project(VERSION ...)` does NOT — it errors. The fallback above is load-bearing, not cosmetic.
 
 **Compat**: any consumer using `find_package(ROSS)` (uppercase) still works — CMake's `find_package` is case-insensitive on the package name; the config file naming changes (see step 4) but we'll ship both `rossConfig.cmake` and a back-compat shim.
 
@@ -204,10 +225,10 @@ Note the `/ross` subdirectory in the install interface. Headers will move (step 
 3. In `core/CMakeLists.txt`:
 ```cmake
 target_link_libraries(ross
-    PUBLIC  MPI::MPI_C    # PUBLIC because public headers include <mpi.h>
+    PUBLIC  MPI::MPI_C    # PUBLIC: ross.h includes <mpi.h>, so consumers need it
     PRIVATE m)
 ```
-   (Verify whether public headers actually include `<mpi.h>`; if only `network-mpi.c` uses it then `PRIVATE` is correct. From the source layout `ross-network.h` -> `network-mpi.h` -> `<mpi.h>` is plausible — needs a quick check during implementation. Default to `PUBLIC` for safety.)
+   MPI must be `PUBLIC`, not `PRIVATE`: [core/ross.h:81](core/ross.h#L81) does `#include <mpi.h>`, and `ross.h` is the primary public header. `ross-gvt.h` and `network-mpi.h` also include it.
 4. Delete `TARGET_INCLUDE_DIRECTORIES(ROSS INTERFACE ${MPI_C_INCLUDE_PATH})`.
 
 **Why**: `MPI::MPI_C` is a properly-named imported target. When we export the package config and add `find_dependency(MPI COMPONENTS C)`, the consumer's CMake re-resolves MPI on its own machine. **This is the single most important change for relocatability.**
@@ -304,7 +325,7 @@ and get includes, MPI dependency, and all link libs propagated correctly.
 
 ---
 
-### Step 6 — Move installed headers under `include/ross/` and clean up `config.h`
+### Step 6 — Move installed headers under `include/ross/`
 
 **File**: `core/CMakeLists.txt`
 
@@ -314,7 +335,7 @@ and get includes, MPI dependency, and all link libs propagated correctly.
 # OLD:
 INSTALL(DIRECTORY ${ROSS_SOURCE_DIR}/ DESTINATION include FILES_MATCHING PATTERN "*.h")
 ```
-   With a curated install under `include/ross/`:
+   With a scoped install under `include/ross/`:
 ```cmake
 install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/ross
@@ -324,17 +345,20 @@ install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/
         PATTERN "risa"  EXCLUDE)
 
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/config.h
-    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/ross
-    RENAME ross-config-build.h)   # avoid generic name collision
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/ross)
 ```
 
-2. Update internal `#include "config.h"` references in core/*.c to `#include "ross-config-build.h"` (or keep `config.h` as the local name in build tree but install as the renamed one — needs a small wrapper header).
+   Keep the filename `config.h`. Once the `/ross/` subdir isolates the include namespace, the generic name is no longer a collision risk — the file now lives at `<prefix>/include/ross/config.h`, not `<prefix>/include/config.h`.
 
-3. For the `INTERFACE` target include path (step 3), point at `${CMAKE_INSTALL_INCLUDEDIR}/ross`. Consumers will use `#include <ross.h>` (which matches existing usage in codes — grep shows `#include <ross.h>` everywhere), and the `ross/` prefix is on the include search path, not in the include statement.
+   Consumers do `#include <ross.h>`, which resolves via the exported target's `${CMAKE_INSTALL_INCLUDEDIR}/ross` interface include dir. Internal headers use `#include "config.h"` (quoted) — which resolves via the including header's own directory, so the installed `ross-base.h` at `<prefix>/include/ross/ross-base.h` finds `<prefix>/include/ross/config.h` without any source edits.
 
-   **Alternative**: install to `include/` (top level) and require consumers use `#include <ross/ross.h>`. This is more strict but breaks all existing `#include <ross.h>` usage in codes. **Recommend the include-path-rooted-at-ross/ approach** to avoid any `.h` source changes.
+2. For the `INTERFACE` target include path (step 3), point at `${CMAKE_INSTALL_INCLUDEDIR}/ross`.
 
-**Why**: stops dumping `lz4.h`, `buddy.h`, `config.h`, `io.h`, `analysis-lp.h`, etc. into the consumer's include namespace. Eliminates the worst pollution risk.
+   **Alternative considered**: install to `include/` (top level) and require consumers use `#include <ross/ross.h>`. This is stricter but breaks all existing `#include <ross.h>` usage in codes and elsewhere. **Rejected** — not worth the source churn for consumers.
+
+**Why**: stops dumping `lz4.h`, `buddy.h`, `config.h`, `io.h`, `analysis-lp.h`, etc. directly into `<prefix>/include/`. Eliminates the pollution risk without requiring source edits to rename `config.h`.
+
+**Earlier draft had a `RENAME config.h → ross-config-build.h` step** — removed. That rename was incomplete ([core/ross-base.h:6](core/ross-base.h#L6) and [core/ross-random.h:4](core/ross-random.h#L4) both `#include "config.h"`; only updating `.c` files would have left the installed headers broken) and unnecessary once the `/ross/` subdir namespacing is in place.
 
 **Compat**: codes' `#include <ross.h>`, `#include "ross.h"` keeps working because the new install include dir (`<prefix>/include/ross`) becomes the search root via the exported target. No source changes needed in codes.
 
@@ -405,7 +429,7 @@ endif()
 
 **File**: `models/CMakeLists.txt`
 
-**Change**: replace with explicit `add_subdirectory(phold)` (and any other models). If you really want auto-discovery, at least restrict the glob to skip build/install/test dirs:
+**Change**: replace with explicit `add_subdirectory(phold)` (and any other models). If you really want auto-discovery, at least restrict to top-level children:
 ```cmake
 file(GLOB model_dirs LIST_DIRECTORIES TRUE
      RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} "*")
@@ -416,9 +440,9 @@ foreach(d ${model_dirs})
     endif()
 endforeach()
 ```
-But explicit listing is preferred — there are only 1-2 models in tree.
+Explicit listing is preferred — there are only 1-2 models in tree.
 
-**Why**: globs miss new files until reconfigure; current glob walks into `build/`, `install/`, `test/` (which exist in-source per presets) and will pick up any stale `CMakeLists.txt` under there.
+**Why**: globs miss new files until reconfigure, and `GLOB_RECURSE` following symlinks is a footgun if a model ever contains a nested build dir. The build dir hazard is modest in practice (the preset's build dir is at `ross/build/`, not `ross/models/build/`), but explicit `add_subdirectory` is clearer and cheaper to maintain.
 
 ---
 
@@ -426,11 +450,30 @@ But explicit listing is preferred — there are only 1-2 models in tree.
 
 **File**: `models/phold/CMakeLists.txt`
 
-**Change**: replace `TARGET_LINK_LIBRARIES(phold ROSS m)` with `target_link_libraries(phold PRIVATE ross::ross m)`. Same for the other 5 phold variants. Also replace the manual file-path install:
+**Change**: replace the three-way `BGPM`/`USE_DAMARIS`/plain link-library branch at [models/phold/CMakeLists.txt:23-38](models/phold/CMakeLists.txt#L23-L38) with namespaced equivalents. Each branch must still be preserved — don't silently drop `imp_bgpm` or `ROSS_Damaris` linkage:
+
 ```cmake
-install(TARGETS phold phold_comm_test phold_gvt_hook_test
-                phold_gvt_hook_model_test phold_gvt_hook_timestamp_test
-                phold_gvt_hook_comm_test
+set(phold_targets
+    phold phold_comm_test phold_gvt_hook_test
+    phold_gvt_hook_model_test phold_gvt_hook_timestamp_test
+    phold_gvt_hook_comm_test)
+
+foreach(t ${phold_targets})
+    target_link_libraries(${t} PRIVATE ross::ross m)
+    if(BGPM)
+        target_link_libraries(${t} PRIVATE imp_bgpm)
+    endif()
+    if(USE_DAMARIS)
+        target_link_libraries(${t} PRIVATE ROSS_Damaris)
+    endif()
+endforeach()
+```
+
+(Verify whether the BGPM branch is still live — it keys on `BGPM` but the top-level option is `USE_BGPM`; the existing file may already be broken. If it's dead, delete the branch outright rather than preserving a non-working path.)
+
+Also replace the manual file-path install:
+```cmake
+install(TARGETS ${phold_targets}
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 ```
 
@@ -444,9 +487,18 @@ install(TARGETS phold phold_comm_test phold_gvt_hook_test
 
 **File**: `models/CMakeLists.txt` (the `ROSS_TEST_SCHEDULERS` and `ROSS_TEST_INSTRUMENTATION` functions)
 
-**Change**: replace `mpirun -np 2 ./${target_name} ...` with `${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2 ${MPIEXEC_PREFLAGS} $<TARGET_FILE:${target_name}> ${MPIEXEC_POSTFLAGS} ...`.
+**Change**: convert from the positional `ADD_TEST(name cmd args...)` form to the keyword `add_test(NAME ... COMMAND ...)` form. The keyword form is what lets us use generator expressions like `$<TARGET_FILE:...>`:
 
-**Why**: respects whatever MPI was found (mpich vs openmpi vs slurm srun); works on systems without `mpirun` in PATH.
+```cmake
+add_test(NAME ${target_name}_SCHED_Optimistic
+         COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2 ${MPIEXEC_PREFLAGS}
+                 $<TARGET_FILE:${target_name}> ${MPIEXEC_POSTFLAGS}
+                 --synch=3 --extramem=100000)
+```
+
+**Why**: respects whatever MPI was found (mpich vs openmpi vs slurm srun); works on systems without `mpirun` in PATH. Generator expressions also make the test location-independent (no more implicit CWD dependency from `./${target_name}`).
+
+**Note**: the positional `ADD_TEST` form does *not* expand generator expressions, so changing the signature is a prerequisite, not an optional cleanup.
 
 ---
 
@@ -463,6 +515,14 @@ if(CMAKE_C_COMPILER_ID STREQUAL "XL" OR CMAKE_C_COMPILER_ID STREQUAL "XLClang")
 endif()
 ```
 Same for BGQ, BGP. Keep generic `-D_GNU_SOURCE` as a target compile definition: `target_compile_definitions(ross PRIVATE _GNU_SOURCE)`.
+
+**Also delete the dead `CXX_FLAGS` assignment bug** at [CMakeLists.txt:117](CMakeLists.txt#L117) and [:124](CMakeLists.txt#L124):
+```cmake
+# BOTH OF THESE ARE NONSENSE — CXX isn't an enabled language:
+SET(CMAKE_CXX_FLAGS "${CMAKE_C_FLAGS}")   # in x86_64 branch
+SET(CMAKE_CXX_FLAGS "${CMAKE_C_FLAGS}")   # in aarch64 branch
+```
+They look like a copy-paste mangling of a C-flags append and currently no-op. Delete outright rather than "fixing" them — the x86_64/aarch64 branches don't need any arch-specific C flags beyond `-D_GNU_SOURCE`, which becomes a target compile definition anyway.
 
 **Why**: applying `-O5 -qarch=pwr9` to ppc64le with gcc/clang is broken. Also avoids polluting parent project flags when ROSS is added via `add_subdirectory`.
 
@@ -523,12 +583,18 @@ endif()
 
 Each phase is independently shippable; Phase 1 alone unblocks the user's stated priority.
 
+**PR granularity within Phase 1**: Steps 3/5/6/7 should land together in a single PR (separate commits are fine for review). Step 3's `INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/ross` commits to the Step 6 install layout, and Step 7's pkg-config `includedir` must match both. Splitting them across PRs produces intermediate states where the exported target points at an include dir that doesn't exist yet. Steps 1, 2, 4 can each go in their own PR.
+
 ## Validation strategy
 
 After each step, validate by:
 1. Build ROSS with current presets: `cmake --preset ross-debug && cmake --build build/debug && cmake --install build/debug`.
-2. Inspect `<prefix>/lib/cmake/ross/rossConfig.cmake` and `rossTargets.cmake` (after Step 5) — verify no absolute MPI paths in `INTERFACE_*` properties.
-3. Write a tiny test consumer:
+2. Inspect `<prefix>/lib/cmake/ross/rossConfig.cmake` and `rossTargets.cmake` (after Step 5) — verify no absolute MPI paths in `INTERFACE_*` properties. Concrete post-condition:
+   ```
+   grep -rE "/opt/homebrew|/usr/local/Cellar|/usr/lib/x86_64-linux-gnu" <prefix>/lib/cmake/ross/
+   ```
+   should return zero hits. If anything matches, the MPI absolute-path leak (Step 4's motivating bug) hasn't been fully fixed.
+3. Write a tiny test consumer **outside the ROSS source tree** (e.g., in `/tmp/ross-consumer/`, not a sibling directory):
    ```cmake
    cmake_minimum_required(VERSION 3.21)
    project(test_ross_consumer C)
@@ -536,8 +602,9 @@ After each step, validate by:
    add_executable(t main.c)
    target_link_libraries(t PRIVATE ross::ross)
    ```
-   pointed at the install prefix via `-Dross_DIR=...`.
+   Configure with `-Dross_DIR=<prefix>/lib/cmake/ross`. Building from a non-sibling dir catches hidden `${CMAKE_CURRENT_SOURCE_DIR}`/`${PROJECT_SOURCE_DIR}` assumptions that pass when the consumer is adjacent to the source.
 4. Build codes against the new install and confirm pkg-config flow still works (Phase 1 should be backward-compatible).
+5. Spot-check version regression: after Step 1, configure in a copy of the source with `.git/` deleted — build should succeed with `0.0.0` fallback, not error.
 
 ---
 
@@ -548,4 +615,5 @@ After each step, validate by:
 - `core/ROSSConfig.cmake` (delete/replace)
 - `core/cmake/rossConfig.cmake.in` (new file)
 - `core/ross.pc.in`
+- `core/ross-config.in` — shell-script wrapper (analogous to `mpicc`/`pkg-config`). Not covered by any step above. If pkg-config + CMake config are the two supported discovery surfaces going forward, this is a deletion candidate. If it's kept, it needs the same `GNUInstallDirs`-derived paths as the other installed artifacts. Decide before merging Phase 1.
 - `models/CMakeLists.txt` and `models/phold/CMakeLists.txt` (Phase 3 dogfooding)
