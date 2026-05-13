@@ -167,9 +167,24 @@ jobs:
         run: ctest --test-dir build --output-on-failure
       - name: Install
         run: cmake --install build
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            build/Testing/Temporary/LastTest.log
+            build/Testing/Temporary/LastTestsFailed.log
+            build/CMakeFiles/CMakeError.log
+            build/CMakeFiles/CMakeOutput.log
+            build/CMakeCache.txt
+          if-no-files-found: ignore
+          retention-days: 14
 ```
 
 The `Install` step is load-bearing for the CMake modernization, not just hygiene: Phase 1 (PR 6) restructures the install tree — header layout, library filename, package config location, pkg-config contents. Everything that's actually under change-management pressure runs at `cmake --install` time, not at build or test time. Without an install step in CI, a regression in `install(EXPORT ...)`, header destination, or `ross.pc` generation goes undetected until someone manually installs and notices CODES broke. Setting `CMAKE_INSTALL_PREFIX` to a workspace-local path keeps the install confined to the runner's checkout.
+
+The `Upload logs on failure` step is the asynchronous-debugging escape hatch. `ctest --output-on-failure` prints the failed-test stdout to the workflow log, but the structured logs (`LastTest.log` for full per-test command + output, `LastTestsFailed.log` for the failure list, `CMakeError.log` / `CMakeOutput.log` for configure-time issues, `CMakeCache.txt` for the resolved configure state) are needed to diagnose anything more than "test X failed." `if: failure()` means the upload only happens when something actually broke, so the artifact storage cost is zero on green runs. `if-no-files-found: ignore` keeps the step from itself failing when, e.g., the build never reached the configure stage and `CMakeCache.txt` doesn't exist. 14-day retention is enough to debug across a weekend without running into GHA's storage quota for a low-volume repo.
 
 3. **Verify green on `master`** before starting any CMake work. If master doesn't pass, fix master first (probably small Trusty-era assumptions surfaced by Ubuntu 24.04).
 4. The manual `cmake -S . -B build -D...` form is the permanent shape of the CI invocation. No preset migration follow-up — there is no `CMakePresets.json` in the tree (see Step 0d). The committed `CMakePresets.json` on the `cmake-improvements` branch was personal scaffolding and is removed in PR 2.
@@ -312,7 +327,14 @@ Lower-case `ross` as the project name is the modern convention (the package name
 
 **Why**: enables `PROJECT_IS_TOP_LEVEL`, modern `install(TARGETS ... FILE_SET HEADERS)` (3.23+) if we want it, `target_link_libraries(... PRIVATE MPI::MPI_C)` clean semantics, and lets the package-version file be auto-generated.
 
-**Regression risk to watch**: `git_describe_working_tree` returns empty on tarball builds / shallow clones / tag-less trees. The current code tolerates empty version strings (they just leak into `ross.pc` as blanks); `project(VERSION ...)` does NOT — it errors. The fallback above is load-bearing, not cosmetic.
+**Regression risk to watch**: `git_describe_working_tree` returns sentinel strings (`GITDIR-NOTFOUND`, `HEAD-HASH-NOTFOUND`, etc. — not empty) on tarball builds / shallow clones / tag-less trees. The current code tolerates these because the regex `string(REGEX REPLACE)` calls just no-op on non-matching input and leak the unparsed value into `ross.pc` as blanks; `project(VERSION ...)` does NOT tolerate them — it errors. The regex-match fallback above is load-bearing, not cosmetic.
+
+Three failure modes worth validating explicitly (Step 1's checklist enumerates each):
+- **(a) No `.git`**: tarball download. Sentinel = `GITDIR-NOTFOUND`.
+- **(b) `.git` present, no tags reachable**: fresh `git init` + commits, or a mirror with tags pruned. `git describe --tags` errors; helper returns a non-numeric sentinel.
+- **(c) Shallow clone past the tag horizon**: `git clone --depth N` where the most recent tag is older than N commits. `git describe --tags` errors. Spack and several CI providers do this routinely.
+
+In all three cases the regex must reject the value and the `WARNING` + `0.0.0` fallback must engage cleanly.
 
 **Compat**: `find_package(ROSS)` (uppercase) is **not** automatically equivalent to `find_package(ross)` — that earlier claim was wrong. CMake searches for `<Name>Config.cmake` using the exact case the caller provides (it does also try a `<lowercase-name>-config.cmake` fallback, but we ship the camelcase `rossConfig.cmake`, not the dashed variant). So `find_package(ROSS)` would not find the new canonical install at `<prefix>/lib/cmake/ross/rossConfig.cmake`.
 
@@ -330,28 +352,24 @@ External users could plausibly be calling `find_package(ROSS)` against the curre
    - `core/CMakeLists.txt`: `${ROSS_SOURCE_DIR}` → `${CMAKE_CURRENT_SOURCE_DIR}`, `${ROSS_BINARY_DIR}` → `${CMAKE_CURRENT_BINARY_DIR}`. Affects [core/CMakeLists.txt:2,187-193](core/CMakeLists.txt#L2-L193) (the directory-scope include — about to be replaced by Step 3 anyway — and four `INSTALL(...)` lines).
    - `models/phold/CMakeLists.txt`: delete `INCLUDE_DIRECTORIES(${ROSS_SOURCE_DIR} ...)` and `INCLUDE_DIRECTORIES(${ROSS_BINARY_DIR})` outright at [models/phold/CMakeLists.txt:1-9](models/phold/CMakeLists.txt#L1-L9) — Step 3's `BUILD_INTERFACE` propagation via `ross::ross` covers them. The raw-path install at [models/phold/CMakeLists.txt:58](models/phold/CMakeLists.txt#L58) is replaced in Step 11.
    - **This forces Step 11 into the same PR as Step 2** (or sooner). Without Step 11's `install(TARGETS ${phold_targets} ...)` rewrite, the broken `${ROSS_BINARY_DIR}/../models/phold/phold` install path remains. See the updated Phase 1 sequencing.
-3. Rename the target and commit to lowercase end-to-end. CMake's default `OUTPUT_NAME` equals the target name, so `add_library(ross ...)` produces `libross.{a,so}` automatically. No `OUTPUT_NAME` property needed:
+3. Rename the *target* to lowercase but explicitly preserve the on-disk filename so existing consumer build directories don't need a cache flush:
 
 ```cmake
 add_library(ross ${ross_srcs})
 add_library(ross::ross ALIAS ross)              # namespaced consumer target
 add_library(ROSS      ALIAS ross)               # back-compat alias for in-tree bare-target callers
 set_target_properties(ross PROPERTIES
+    OUTPUT_NAME ROSS                             # preserve libROSS.{a,so} filename (matches master)
     EXPORT_NAME ross)                            # exports as ross::ross via namespace
 ```
 
-   **Library filename rename — `libROSS.{a,so}` → `libross.{a,so}`.** This is a deliberate consistency change: lowercase package name (`find_package(ross)`), lowercase pkg-config (`ross.pc`), lowercase namespaced target (`ross::ross`), lowercase library file. The on-disk filename is the only remaining uppercase artifact today; collapsing it removes the asymmetry. Grep across CODES, NetMaestro, and ROSS itself before deciding showed:
-   - Zero source-tree references to `-lROSS` or `libROSS` in CODES (the hits in `test/build.ninja` and `CMakeCache.txt` are auto-regenerated build artifacts that pick up the new name on reconfigure).
-   - Zero references in NetMaestro.
-   - The two committed ROSS-side references (`core/ross-config.in:45`, `core/ross.pc.in:5`) are already handled — `ross-config.in` is deleted in Step 0c, and `ross.pc.in` is rewritten in Step 7 with the new lowercase flag.
-
-   No consumer-side source changes required. Anyone using pkg-config or `find_package(ross)` picks up `-lross` / `libross.a` transparently on reconfigure.
+   **Library filename intentionally preserved as `libROSS.{a,so}`.** A purely cosmetic rename to `libross.{a,so}` was considered and rejected: it would invalidate every existing consumer's cached `pkgcfg_lib_ROSS_ROSS:FILEPATH=.../libROSS.a` pkg-config entry, forcing every CODES developer (and any other ROSS consumer) to run `cmake --fresh` once on the first reconfigure after upgrade. The lowercase-everything-on-disk consistency win didn't justify the multi-developer coordination cost. The target name, package name (`find_package(ross)`), pkg-config name (`ross.pc`), and namespaced consumer target (`ross::ross`) are all lowercase as planned — only the on-disk filename stays uppercase to match master, which keeps Step 7's `Libs: -lROSS` flag and existing consumer caches valid.
 
 4. Convert `TARGET_LINK_LIBRARIES(ROSS ${ROSS_EXTERNAL_LIBS})` to keyword form (see steps 3 and 5).
 
-**Why**: gives us a namespaced target AND finishes the lowercase consistency story. End-to-end one mental model: `ross` is the package name, library file, find_package name, pkg-config name, and namespaced target.
+**Why**: namespaced target + clean keyword-signature linking + explicit preservation of the on-disk filename so the migration is consumer-transparent at the link layer. CMake-level surfaces (find_package, pkg-config name, exported target) move to lowercase; the artifact filename does not.
 
-**Compat**: the in-tree `models/phold/CMakeLists.txt` still uses bare `ROSS` — `add_library(ROSS ALIAS ross)` keeps it working until Step 11 migrates it to `ross::ross`. The alias is on the *target* name, independent of the library filename — it stays valid regardless of the `libROSS.a` → `libross.a` rename.
+**Compat**: the in-tree `models/phold/CMakeLists.txt` still uses bare `ROSS` — `add_library(ROSS ALIAS ross)` keeps it working until Step 11 migrates it to `ross::ross`. The alias is on the *target* name, independent of `OUTPUT_NAME`. Existing CODES build directories continue to link `libROSS.a` without any cache flush.
 
 ---
 
@@ -411,22 +429,34 @@ SET(BUILD_SHARED_LIBS ${ROSS_BUILD_SHARED_LIBS})
 ```
 This is wrong on three counts:
 - Two knobs for one decision — `BUILD_SHARED_LIBS` is the standard, discoverable CMake variable; nobody guesses `ROSS_BUILD_SHARED_LIBS`.
-- `set(BUILD_SHARED_LIBS ...)` (without `CACHE`) shadows the parent project when ROSS is `add_subdirectory`'d, silently producing a static `libross.a` inside a shared-by-default superbuild.
+- `set(BUILD_SHARED_LIBS ...)` (without `CACHE`) shadows the parent project when ROSS is `add_subdirectory`'d, silently producing a static `libROSS.a` inside a shared-by-default superbuild.
 - It's not how modern CMake projects handle this.
 
 **Changes**:
 1. Delete the `OPTION(ROSS_BUILD_SHARED_LIBS ...)` and the `SET(BUILD_SHARED_LIBS ...)` line. The `add_library(ross ${ross_srcs})` from Step 2 then defers to the standard `BUILD_SHARED_LIBS` (default static when unset).
-2. Add a one-release deprecation shim at the top of `core/CMakeLists.txt`, same pattern as Step 15:
+2. Add a one-release deprecation shim at the top of `core/CMakeLists.txt`. Gate the value-honoring `set()` on `PROJECT_IS_TOP_LEVEL` so it doesn't re-introduce the very superbuild-stomping bug this step is fixing:
 ```cmake
 if(DEFINED ROSS_BUILD_SHARED_LIBS)
     message(DEPRECATION
-        "ROSS_BUILD_SHARED_LIBS is deprecated; use the standard "
-        "BUILD_SHARED_LIBS variable (-DBUILD_SHARED_LIBS=ON).")
-    if(NOT DEFINED BUILD_SHARED_LIBS)
+        "ROSS_BUILD_SHARED_LIBS is deprecated; set the standard "
+        "BUILD_SHARED_LIBS variable instead (-DBUILD_SHARED_LIBS=ON).")
+    if(PROJECT_IS_TOP_LEVEL)
+        # Top-level: deprecated knob is the user's intentional setter; honor it.
+        # FORCE so `-DROSS_BUILD_SHARED_LIBS=OFF` on a reconfigure actually flips
+        # the cache value back (without FORCE, the prior cache entry sticks).
         set(BUILD_SHARED_LIBS ${ROSS_BUILD_SHARED_LIBS} CACHE BOOL "" FORCE)
     endif()
+    # add_subdirectory mode: deprecation message fires (user is told to migrate),
+    # but ROSS does NOT touch the parent's BUILD_SHARED_LIBS. The whole point of
+    # Step 4b is to stop ROSS from silently overriding the superbuild's link mode;
+    # honoring the deprecated knob inside a subdirectory consumer would re-create
+    # exactly that bug.
 endif()
 ```
+Why the gating matters — two failure modes the naïve `if(NOT DEFINED BUILD_SHARED_LIBS)` guard misses:
+- **Reconfigure with a flipped value**: first configure with `-DROSS_BUILD_SHARED_LIBS=ON` writes `BUILD_SHARED_LIBS=ON` to the cache. Second configure with `-DROSS_BUILD_SHARED_LIBS=OFF` finds `BUILD_SHARED_LIBS` already defined (in cache from prior run), guard skips the shim, ROSS still builds shared. User's deprecated-knob change is silently ignored. `FORCE` plus the top-level gate fixes this — at top level the cache value tracks the deprecated knob each configure.
+- **Subdirectory + ungated FORCE**: parent superbuild relies on the default `BUILD_SHARED_LIBS` (doesn't set it). User passes `-DROSS_BUILD_SHARED_LIBS=ON`. With ungated `FORCE`, the shim writes `BUILD_SHARED_LIBS=ON` into the global cache — every sibling target in the superbuild that was implicitly static is now shared. Same class of bug as the original. Gating on `PROJECT_IS_TOP_LEVEL` is the fix.
+
 Remove the shim in a follow-up release after a soak period.
 3. **Update [CLAUDE.md](CLAUDE.md)** — under "Build", add a one-liner: "Default is a static library. Pass `-DBUILD_SHARED_LIBS=ON` to build shared."
 
@@ -463,12 +493,15 @@ Remove the shim in a follow-up release after a soak period.
 #     get_target_property(dirs ross::ross INTERFACE_INCLUDE_DIRECTORIES)
 #
 # Path B consumer contract for headers:
-#     #include <ross.h>           — supported
-#     #include <ross-extern.h>    — supported (top-level ross-*.h)
-#     #include <instrumentation/...> — UNSUPPORTED (internal headers,
-#         reachable via BUILD_INTERFACE but may be hidden in a future
-#         release). See future-refactor-tasks.md "Header hygiene &
-#         public/internal split".
+#     #include <ross.h>                  — supported
+#     #include <ross-extern.h>           — supported (top-level ross-*.h)
+#     #include <ross-gvt-internal.h>     — NOT INSTALLED (excluded from
+#         install rule; *-internal.h headers never ship to consumers)
+#     #include <instrumentation/...>     — UNSUPPORTED (subdirectory and
+#         other internal headers ship today but consumers should not
+#         depend on them; reachable via BUILD_INTERFACE but may be
+#         hidden in a future release). See future-refactor-tasks.md
+#         "Header hygiene & public/internal split".
 
 include(CMakeFindDependencyMacro)
 find_dependency(MPI REQUIRED COMPONENTS C)
@@ -587,12 +620,15 @@ install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/ross
     FILES_MATCHING
         PATTERN "*.h"
+        PATTERN "*-internal.h" EXCLUDE   # ross-gvt-internal.h, ross-random-internal.h — never public
         PATTERN "cmake" EXCLUDE
         PATTERN "risa"  EXCLUDE)
 
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/config.h
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/ross)
 ```
+
+   The `*-internal.h` exclude makes the Path B contract enforceable: the contract says "any top-level `ross-*.h` *except* `*-internal.h` is supported," and excluding the file from the install means a consumer cannot accidentally depend on it through the install tree. Two files match today (`ross-gvt-internal.h`, `ross-random-internal.h`); future internal headers that follow the naming convention are caught automatically.
 
    The `risa` exclude is defensive — Step 0 already disabled the `add_subdirectory(risa)` path so the headers are unused, but keep the exclude so a future re-enable doesn't accidentally start shipping risa headers without a deliberate decision.
 
@@ -604,7 +640,9 @@ install(FILES ${CMAKE_CURRENT_BINARY_DIR}/config.h
 
    **Alternative considered**: install to `include/` (top level) and require consumers use `#include <ross/ross.h>`. This is stricter but breaks all existing `#include <ross.h>` usage in codes and elsewhere. **Rejected** — not worth the source churn for consumers.
 
-**Consumer contract — Path B**: external consumers may `#include <ross.h>` or any top-level `ross-*.h` header (e.g. `<ross-extern.h>`, `<ross-types.h>`). Subdirectory headers (`<instrumentation/...>`, `<check-revent/...>`, `<queue/...>`, `<rio/...>`) and internal headers (`<buddy.h>`, `<lz4.h>`, `<hash-quadratic.h>`) are **not** part of the supported surface — build-tree consumers can still reach them via the BUILD_INTERFACE include path, but this is an unsupported artifact and will be hidden when the public/private header split lands (see [future-refactor-tasks.md](future-refactor-tasks.md)).
+**Consumer contract — Path B**: external consumers may `#include <ross.h>` or any top-level `ross-*.h` header (e.g. `<ross-extern.h>`, `<ross-types.h>`) **except** the `*-internal.h` siblings. `ross-gvt-internal.h` and `ross-random-internal.h` are top-level by file location but obviously internal by name; the install rule above excludes `*-internal.h` so they never ship to `<prefix>/include/ross/` and consumers cannot accidentally depend on them. Subdirectory headers (`<instrumentation/...>`, `<check-revent/...>`, `<queue/...>`, `<rio/...>`) and other internal headers (`<buddy.h>`, `<lz4.h>`, `<hash-quadratic.h>`) DO ship in this PR — they're inside the install directory and the directory install picks them up — but they are **not** part of the supported surface either. Build-tree consumers can also reach the unsupported headers via the BUILD_INTERFACE include path. Both surfaces are unsupported artifacts and will be hidden when the public/private header split lands (see [future-refactor-tasks.md](future-refactor-tasks.md)).
+
+The asymmetry is deliberate: `*-internal.h` is a cheap, exact-match exclude that catches the highest-risk surface (top-level files that look public by location). Excluding the subdirectory and other internal headers is a bigger decision — multiple files, requires per-header judgment ("is `crv-state.h` actually public?"), and is correctly deferred to the future header-hygiene work.
 
 Path B matches what CODES already does: ~40 files use `#include <ross.h>`, plus 4 redundant `#include <ross-extern.h>` references in [src/surrogate/](../codes/src/surrogate/) that already work transparently because `ross.h` pulls in `ross-extern.h` via [core/ross.h:109](core/ross.h#L109). **No CODES source changes are required for the CMake PR.**
 
@@ -638,7 +676,7 @@ Name: ross
 Description: Rensselaer's Optimistic Simulation System
 URL: https://github.com/ROSS-org/ROSS
 Version: @PROJECT_VERSION@
-Libs: -L${libdir} -lross -lm
+Libs: -L${libdir} -lROSS -lm
 Cflags: -I${includedir}
 ```
 3. Install to `${CMAKE_INSTALL_LIBDIR}/pkgconfig`.
@@ -784,6 +822,8 @@ add_test(NAME ${target_name}_SCHED_Sequential
 Mixing `${MPIEXEC_EXECUTABLE}` into the sequential cases would launch them under MPI for no reason and break the `--synch=1`/`--synch=4`/`--synch=6` single-rank contract that `--synch=6` (rollback-check) and `--synch=4` (optimistic debug) depend on.
 
 **Note**: the positional `ADD_TEST` form does *not* expand generator expressions, so changing the signature is a prerequisite, not an optional cleanup.
+
+**Single-word launcher assumption.** ROSS's ctest suite assumes `${MPIEXEC_EXECUTABLE}` resolves to a single-word launcher (`mpirun`, `mpiexec`). `${MPIEXEC_PREFLAGS}` and `${MPIEXEC_POSTFLAGS}` are passed through as-is; on most discoveries they're empty, on some HPC sites they may be a multi-word string that doesn't list-expand cleanly inside `add_test(... COMMAND ...)`. We do not use `SEPARATE_ARGUMENTS` to fix this because multi-word HPC launchers (`srun`, `jsrun` with site-specific flags) are out of scope for this test suite — ctest runs the unit/integration layer in seconds with `mpirun -np 2`, not HPC scaling validation. Sites running ROSS under a scheduler drive the binaries directly via `salloc`/`sbatch` or a site-specific harness, not via ctest. If a future HPC-CI use case appears, that's the moment to add `SEPARATE_ARGUMENTS` (or to write a separate test driver), not now.
 
 ---
 
@@ -997,22 +1037,20 @@ So the realistic breakage modes are narrow: header path collisions (something CO
 1. **Land PR 1 (CI restoration) and Phase 0 (PR 2 — Damaris + Coveralls + ross-config deletions) on ROSS master first.** Both are independent of CODES.
 2. **Before merging Phase 1, build CODES locally against the Phase 1 install.** The plan's validation strategy already covers this; the timing is "pre-merge," not "post-merge." Concretely:
    - Build ROSS from the `cmake-improvements` branch, install to `install/debug`.
-   - In CODES: `rm -rf build/debug` (or `cmake --fresh`) to clear the cached `pkgcfg_lib_ROSS_ROSS:FILEPATH=...libROSS.a` entry that points at the old library filename.
-   - Reconfigure and build CODES. Run its test suite. Iterate on whichever side breaks.
+   - Reconfigure CODES against the new ROSS install — no `cmake --fresh` needed. Library filename `libROSS.{a,so}` is preserved (Step 2's `OUTPUT_NAME ROSS`), so cached `pkgcfg_lib_ROSS_ROSS` entries stay valid. The new `includedir=<prefix>/include/ross` flows through automatically because `pkg_check_modules` re-reads `Cflags` from pkg-config on every configure.
+   - Build CODES, run its test suite. Iterate on whichever side breaks.
 3. **Merge Phase 1 only after CODES builds clean.** This is the cheap-coordination version of a contract test (the real one is post-Phase-3 — see [future-refactor-tasks.md](future-refactor-tasks.md) "CODES contract test").
-4. **After ROSS Phase 1 lands**, CODES users (just you for now) need to `cmake --fresh` or delete their CODES build directory once to flush the stale pkg-config cache. The first reconfigure picks up the new library name (`libross.{a,so}`) and new include path (`<prefix>/include/ross/`).
+4. **After ROSS Phase 1 lands**, CODES users update by reinstalling ROSS and reconfiguring CODES — no special steps, no cache flush. The library filename is unchanged from master so cached `pkgcfg_lib_*` entries stay valid; the include-path move is picked up by `pkg_check_modules` re-reading pkg-config naturally.
 
-### Why the one-time cache flush is needed (`pkgcfg_lib_ROSS_ROSS`)
+### Why no cache flush is needed (`pkgcfg_lib_ROSS_ROSS`)
 
-When CODES configures, `pkg_check_modules(ROSS REQUIRED IMPORTED_TARGET ross)` shells out to pkg-config, reads `Libs: -L${libdir} -lROSS -lm`, and **resolves each `-l<name>` to an absolute path** by searching the `-L` library dirs. The resolved paths are stored as `FILEPATH` cache entries — e.g. `pkgcfg_lib_ROSS_ROSS:FILEPATH=/Users/.../install/debug/lib/libROSS.a`. `PkgConfig::ROSS`'s `INTERFACE_LINK_LIBRARIES` references those cached absolute paths.
+When CODES configures, `pkg_check_modules(ROSS REQUIRED IMPORTED_TARGET ross)` shells out to pkg-config, reads `Libs: -L${libdir} -lROSS -lm`, and **resolves each `-l<name>` to an absolute path** by searching the `-L` library dirs. The resolved paths are stored as `FILEPATH` cache entries — e.g. `pkgcfg_lib_ROSS_ROSS:FILEPATH=/Users/.../install/debug/lib/libROSS.a`. `PkgConfig::ROSS`'s `INTERFACE_LINK_LIBRARIES` references those cached absolute paths. The cache step is a performance optimization — re-running pkg-config + filesystem-resolve on every configure would be expensive. CMake assumes the cached path is still valid on subsequent configures.
 
-The cache step is a performance optimization — re-running pkg-config + filesystem-resolve on every configure would be expensive. CMake assumes the cached path is still valid on subsequent configures.
+A naïve lowercase-everything refactor would invalidate that assumption: rename the library file to `libross.{a,so}` and change `ross.pc` to say `-lross`, and every CODES build dir's cached `pkgcfg_lib_ROSS_ROSS:FILEPATH=/.../libROSS.a` entry now points at a file that no longer exists. The fix is `cmake --fresh` or `rm -rf <build-dir>`, but it's a one-time forced action for every consumer.
 
-PR 6 invalidates that assumption exactly once: Step 2 renames the library file `libROSS.{a,so}` → `libross.{a,so}`, and Step 7 updates `ross.pc` to say `-lross`. After upgrading ROSS, a CODES reconfigure trusts the cached `pkgcfg_lib_ROSS_ROSS:FILEPATH=/.../libROSS.a` entry without re-resolving it, sees the path doesn't point at a file anymore (because `libROSS.a` was replaced by `libross.a`), and either errors at link time or silently falls back to whatever the linker finds on the default library path.
+The plan deliberately avoids that cost: Step 2 keeps `OUTPUT_NAME ROSS` so the file stays `libROSS.{a,so}`, and Step 7's `ross.pc` keeps `-lROSS`. The pkg-config Libs line and resolved library path are byte-identical to master — cached entries from a pre-Phase-1 CODES build still resolve correctly after upgrade.
 
-`cmake --fresh` (CMake 3.24+) or `rm -rf <build-dir>` wipes the cache, so the next configure re-runs `pkg_check_modules` from scratch, sees `-lross`, resolves it to `libross.a`, and re-caches with the new path. **One-time only** — future ROSS upgrades on PR 6+ master don't re-trigger this because the filename stays `libross.{a,so}` from then on. Any time an upstream library renames its file, dependents eat one cache flush.
-
-This is the only consumer-side coordination cost in Phase 1, and it's not specific to ROSS's CMake refactor — it's a generic CMake behavior triggered specifically by the library rename in Step 2. Everything else (the namespace, the package config location, the header reorganization under `include/ross/`) is back-compat-preserved or handled by `pkg_check_modules` re-running pkg-config naturally.
+The only path that *does* change in pkg-config output is `includedir` (now `<prefix>/include/ross` per Step 6), but that's not cached as a `FILEPATH` — `pkg_check_modules` re-reads `Cflags` from pkg-config on every configure, so the new include directory flows through automatically.
 
 ### If CODES breaks anyway
 
