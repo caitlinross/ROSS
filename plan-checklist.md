@@ -5,6 +5,16 @@ See [plan.md](plan.md) for full context and rationale.
 ## Pre-flight decisions (resolve before Phase 1 lands)
 - [ ] Decide the fate of [core/ross-config.in](core/ross-config.in) — shell-script consumer wrapper. If pkg-config + CMake config are the supported discovery surfaces going forward, delete it. Otherwise, port its install path to `GNUInstallDirs`-derived vars as part of Step 8
 
+## Phase 0 — Disable Damaris/RISA in CMake (lands first, own PR)
+
+### Step 0 — Remove `USE_DAMARIS` build paths
+- [ ] Delete `OPTION(USE_DAMARIS ...)` and the dependent `IF(USE_DAMARIS) ... ADD_SUBDIRECTORY(risa) ... INCLUDE_DIRECTORIES(${DAMARIS_INCLUDE}) ... ENDIF()` block at [core/CMakeLists.txt:119-125](core/CMakeLists.txt#L119-L125)
+- [ ] Delete `IF(USE_DAMARIS) INCLUDE_DIRECTORIES(${DAMARIS_INCLUDE}) ENDIF` at [models/phold/CMakeLists.txt:2-4](models/phold/CMakeLists.txt#L2-L4)
+- [ ] Delete the `IF(USE_DAMARIS) ... ELSE` Damaris branch at [models/phold/CMakeLists.txt:27-37](models/phold/CMakeLists.txt#L27-L37) — collapse to the plain `target_link_libraries(... ROSS m)` form
+- [ ] Leave `core/risa/` submodule and `#cmakedefine USE_DAMARIS` in `config.h.in` in place — both inert without the CMake option, and a future PR can rip them out
+- [ ] Update [CLAUDE.md](CLAUDE.md): remove the Damaris/RISA bullet from "Optional subsystems"; note Damaris is disabled pending future removal of C source paths
+- [ ] Verify a clean configure + build still succeeds with `USE_DAMARIS` no longer existing as a cache variable (run `cmake --preset ross-debug && cmake --build --preset ross-debug`)
+
 ## Phase 1 — Export story (unblocks `codes` using `find_package(ross CONFIG)`)
 
 ### Step 1 — Bump `cmake_minimum_required` and fix top-level `project()`
@@ -20,6 +30,10 @@ See [plan.md](plan.md) for full context and rationale.
 
 ### Step 2 — Drop nested `project()` in `core/` and set up target hygiene
 - [ ] Delete `PROJECT(ROSS C)` line in `core/CMakeLists.txt`
+- [ ] **Sweep `${ROSS_SOURCE_DIR}` / `${ROSS_BINARY_DIR}` references** — both become empty after the nested project goes away. Without this sweep, four `INSTALL(...)` lines and three `INCLUDE_DIRECTORIES(...)` lines silently install/look in `/`:
+  - [ ] `core/CMakeLists.txt`: replace `${ROSS_SOURCE_DIR}` → `${CMAKE_CURRENT_SOURCE_DIR}` and `${ROSS_BINARY_DIR}` → `${CMAKE_CURRENT_BINARY_DIR}` (lines 2, 187, 188, 189, 193)
+  - [ ] `models/phold/CMakeLists.txt`: delete `INCLUDE_DIRECTORIES(${ROSS_BINARY_DIR})` and `INCLUDE_DIRECTORIES(${ROSS_SOURCE_DIR} ...)` lines outright at [models/phold/CMakeLists.txt:1-9](models/phold/CMakeLists.txt#L1-L9) — Step 3's `BUILD_INTERFACE` propagation via `ross::ross` covers them. The raw-path install at [line 58](models/phold/CMakeLists.txt#L58) is replaced by Step 11
+  - [ ] **Step 11 must land in the same PR as Step 2** — without it, the install at line 58 is broken. See updated Phase 1 sequencing
 - [ ] Remove `INCLUDE_DIRECTORIES(${ROSS_SOURCE_DIR} ${ROSS_BINARY_DIR})` directory-scope include (replaced in step 3)
 - [ ] Rename target: `add_library(ross ${ross_srcs})`
 - [ ] Add `add_library(ross::ross ALIAS ross)`
@@ -53,7 +67,7 @@ See [plan.md](plan.md) for full context and rationale.
 - [ ] (Optional) Add uppercase back-compat shim at `${CMAKE_INSTALL_LIBDIR}/cmake/ROSS/ROSSConfig.cmake`
 
 ### Step 6 — Install headers under `include/ross/`
-- [ ] Replace catch-all header install with scoped `install(DIRECTORY ... DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/ross ...)` (exclude `cmake`, `risa`)
+- [ ] Replace catch-all header install with scoped `install(DIRECTORY ... DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/ross ...)` (exclude `cmake`, `risa` — `risa` exclude is defensive since Step 0 already disabled the build path)
 - [ ] Install generated `config.h` to `${CMAKE_INSTALL_INCLUDEDIR}/ross` **without renaming** — the `/ross/` subdir already isolates it from consumer collisions, and renaming would require edits to [core/ross-base.h](core/ross-base.h) and [core/ross-random.h](core/ross-random.h) which `#include "config.h"`. Earlier draft said to rename to `ross-config-build.h`; that's been dropped
 - [ ] Verify `#include <ross.h>` still resolves via exported INCLUDES destination
 - [ ] Verify installed `ross-base.h`'s `#include "config.h"` resolves (quoted-include search finds `config.h` in the same installed directory)
@@ -63,6 +77,7 @@ See [plan.md](plan.md) for full context and rationale.
 - [ ] Use `prefix=@CMAKE_INSTALL_PREFIX@`, `libdir=${prefix}/@CMAKE_INSTALL_LIBDIR@`, `includedir=${prefix}/@CMAKE_INSTALL_INCLUDEDIR@/ross`
 - [ ] Use `@PROJECT_VERSION@` for the `Version:` field
 - [ ] Install `ross.pc` to `${CMAKE_INSTALL_LIBDIR}/pkgconfig`
+- [ ] **Do NOT add MPI flags** to `Cflags`/`Libs`. Intent: pkg-config is back-compat only. Consumers compile with `mpicc`, so MPI is transparent. The CMake config (Step 5) is the supported path going forward; `ross.pc` stays minimal until it's deprecated
 
 ### Phase 1 validation
 - [ ] Build ROSS with current presets: `cmake --preset ... && cmake --build ... && cmake --install ...`
@@ -71,8 +86,20 @@ See [plan.md](plan.md) for full context and rationale.
 - [ ] Build `codes` against the new install — confirm pkg-config flow still works
 - [ ] Tarball regression: delete `.git/` in a copy of the source, reconfigure, confirm Step 1's `0.0.0` fallback engages without error
 
+### Step 11 (now Phase 1) — Update `models/phold/CMakeLists.txt` to use namespaced target
+**Moved from Phase 3 because Step 2's removal of `${ROSS_BINARY_DIR}` invalidates the raw-path install — Step 11's `install(TARGETS ...)` rewrite is the fix. Must land in the same PR as Step 2.**
+
+- [ ] Define `set(phold_targets phold phold_comm_test phold_gvt_hook_test phold_gvt_hook_model_test phold_gvt_hook_timestamp_test phold_gvt_hook_comm_test)`
+- [ ] Replace per-target `TARGET_LINK_LIBRARIES(... ROSS m)` lines with a `foreach(t ${phold_targets}) target_link_libraries(${t} PRIVATE ross::ross m) endforeach()` (Damaris branch is gone — Step 0 removed `USE_DAMARIS`)
+- [ ] Audit the `BGPM` branch — top-level option is `USE_BGPM`, the phold branch keys on `BGPM` (likely already broken). If dead, delete; if live, gate on `USE_BGPM` instead
+- [ ] Replace raw-file-path install at [models/phold/CMakeLists.txt:58](models/phold/CMakeLists.txt#L58) with `install(TARGETS ${phold_targets} RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})` — install all 6 variants, not just `phold`
+- [ ] **Keep** the `add_library(ROSS ALIAS ross)` shim from Step 2 — cheap insurance for any out-of-tree code still referencing bare `ROSS`. Remove in a follow-up after a soak period
+
 ### Phase 1 sequencing note
-Steps 3 / 5 / 6 / 7 must land in a single PR (separate commits are fine for review). Step 3's `INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/ross` commits to the Step 6 install layout, and Step 7's `ross.pc` `includedir` must match both. Splitting across PRs leaves intermediate states with exported targets pointing at paths that don't exist yet. Steps 1, 2, 4 can each ship independently.
+- **Steps 2 + 11 must land together** — Step 2 deletes `${ROSS_BINARY_DIR}`, which Step 11 replaces with `install(TARGETS ...)`. Splitting them leaves a broken install line referencing an empty variable.
+- **Steps 3 / 5 / 6 / 7 must land together** (separate commits fine for review). Step 3's `INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/ross` commits to the Step 6 install layout, and Step 7's `ross.pc` `includedir` must match both. Splitting across PRs leaves intermediate states with exported targets pointing at paths that don't exist yet.
+- Steps 1 and 4 can each ship independently.
+- Pragmatic option: bundle all of Phase 1 into a single PR with one commit per step — interdependencies are tight enough that staged review across multiple PRs costs more than it gains.
 
 ---
 
@@ -84,6 +111,7 @@ Steps 3 / 5 / 6 / 7 must land in a single PR (separate commits are fine for revi
 - [ ] Replace every `DESTINATION bin` with `DESTINATION ${CMAKE_INSTALL_BINDIR}`
 - [ ] Replace every `DESTINATION include` with `DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}` (or `.../ross` where needed)
 - [ ] Audit `models/phold/CMakeLists.txt` for hard-coded paths
+- [ ] **Fix the RPATH stanza** at [CMakeLists.txt:35-37](CMakeLists.txt#L35-L37) — both the `LIST(FIND ... isSystemDir)` check and the `SET(CMAKE_INSTALL_RPATH ...)` line hard-code `${CMAKE_INSTALL_PREFIX}/lib`. Change to `${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBDIR}`. Different construction than `DESTINATION lib`, so the sweep above won't catch it
 
 ### Step 9 — Gate top-level-only behavior on `PROJECT_IS_TOP_LEVEL`
 - [ ] Wrap `include(CTest)` / `enable_testing()` in `if(PROJECT_IS_TOP_LEVEL)`
@@ -109,12 +137,7 @@ Steps 3 / 5 / 6 / 7 must land in a single PR (separate commits are fine for revi
 ### Step 10 — Replace `FILE(GLOB_RECURSE)` in `models/CMakeLists.txt`
 - [ ] Replace recursive glob with explicit `add_subdirectory(phold)` (and any other models). Note: the build-dir hazard is modest in practice (build dir is `ross/build/`, not `ross/models/build/`) — the real reason is that globs skip new/removed files until reconfigure and `FOLLOW_SYMLINKS` is a footgun
 
-### Step 11 — Dogfood `ross::ross` namespace in phold model
-- [ ] Update all 6 phold variants to `target_link_libraries(${t} PRIVATE ross::ross m)` (loop over a `phold_targets` list rather than repeating)
-- [ ] **Preserve `BGPM` / `USE_DAMARIS` branches** — don't silently drop `imp_bgpm` or `ROSS_Damaris` linkage. Either port each branch or, if confirmed dead, delete explicitly
-- [ ] Audit the `BGPM` branch specifically — the top-level option is `USE_BGPM`, the phold branch keys on `BGPM` (likely already broken)
-- [ ] Replace raw-file-path install at [models/phold/CMakeLists.txt:58](models/phold/CMakeLists.txt#L58) with `install(TARGETS ... RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})` — install all 6 variants, not just `phold`
-- [ ] Remove the `ROSS` back-compat alias from step 2 once all callsites are migrated
+### Step 11 — moved to Phase 1 (see above)
 
 ### Step 12 — Use `MPIEXEC_*` variables in test functions
 - [ ] Convert positional `ADD_TEST(name cmd args)` to keyword `add_test(NAME ... COMMAND ...)` form — **prerequisite**, since the positional form does not expand generator expressions

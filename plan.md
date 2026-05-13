@@ -125,6 +125,22 @@ The plan is ordered: do the export-system changes first (steps 1–6), then qual
 
 ---
 
+### Step 0 — Pre-flight: disable Damaris/RISA in CMake
+
+**Files**: `core/CMakeLists.txt`, `models/phold/CMakeLists.txt`, `CLAUDE.md`
+
+**Context**: Damaris does not currently build (verified during phase-I attempt) and has no known consumers. Rather than carry the dead build paths through the modernization, disable it up front so subsequent steps don't have to reason about it. RISA / risa headers / `add_subdirectory(risa)` go away with it. Final removal of the C source paths and the submodule is deferred — only the CMake entry points are removed here.
+
+**Changes**:
+1. In `core/CMakeLists.txt`, delete the entire `OPTION(USE_DAMARIS ...)` block and the dependent `IF(USE_DAMARIS) ... ADD_SUBDIRECTORY(risa) ... ENDIF()` (currently [core/CMakeLists.txt:119-125](core/CMakeLists.txt#L119-L125)).
+2. In `models/phold/CMakeLists.txt`, delete the `IF(USE_DAMARIS) ... ELSE` branches at [models/phold/CMakeLists.txt:2-4](models/phold/CMakeLists.txt#L2-L4) and [:27-37](models/phold/CMakeLists.txt#L27-L37) — collapse to the plain `target_link_libraries(... ROSS m)` form. (Step 11 then has no Damaris branch to preserve.)
+3. Leave `core/risa/` and the `#cmakedefine USE_DAMARIS` in `config.h.in` in place — without the CMake option, both are inert. A future PR can rip them out once nobody objects.
+4. Update [CLAUDE.md](CLAUDE.md) "Optional subsystems" — remove the Damaris/RISA bullet, note that Damaris is removed pending future cleanup of the C source paths.
+
+**Why**: the rest of the plan (especially Steps 6 and 11) had carve-outs for Damaris/RISA. Doing this first makes those carve-outs disappear and shrinks the plan's surface area. The `USE_DAMARIS=ON` case in Step 6 (risa header install) is no longer a question.
+
+---
+
 ### Step 1 — Bump `cmake_minimum_required` and fix top-level `project()`
 
 **File**: `CMakeLists.txt` (top level)
@@ -176,7 +192,10 @@ Lower-case `ross` as the project name is the modern convention (the package name
 
 **Changes**:
 1. Delete `PROJECT(ROSS C)` line. The `core/` directory is part of the parent `ross` project.
-2. Replace `INCLUDE_DIRECTORIES(${ROSS_SOURCE_DIR} ${ROSS_BINARY_DIR})` (directory scope) with target-scoped includes (see step 3).
+2. **Sweep `${ROSS_SOURCE_DIR}` / `${ROSS_BINARY_DIR}` references.** These variables were set by the nested `PROJECT(ROSS C)` and become empty as soon as it's removed. Fix every remaining use:
+   - `core/CMakeLists.txt`: `${ROSS_SOURCE_DIR}` → `${CMAKE_CURRENT_SOURCE_DIR}`, `${ROSS_BINARY_DIR}` → `${CMAKE_CURRENT_BINARY_DIR}`. Affects [core/CMakeLists.txt:2,187-193](core/CMakeLists.txt#L2-L193) (the directory-scope include — about to be replaced by Step 3 anyway — and four `INSTALL(...)` lines).
+   - `models/phold/CMakeLists.txt`: delete `INCLUDE_DIRECTORIES(${ROSS_SOURCE_DIR} ...)` and `INCLUDE_DIRECTORIES(${ROSS_BINARY_DIR})` outright at [models/phold/CMakeLists.txt:1-9](models/phold/CMakeLists.txt#L1-L9) — Step 3's `BUILD_INTERFACE` propagation via `ross::ross` covers them. The raw-path install at [models/phold/CMakeLists.txt:58](models/phold/CMakeLists.txt#L58) is replaced in Step 11.
+   - **This forces Step 11 into the same PR as Step 2** (or sooner). Without Step 11's `install(TARGETS ${phold_targets} ...)` rewrite, the broken `${ROSS_BINARY_DIR}/../models/phold/phold` install path remains. See the updated Phase 1 sequencing.
 3. Rename the target. Keep the library file output name `ROSS` (so `libROSS.a` stays, preserving pkg-config's `-lROSS`), but use target name `ross` so we can do the modern alias dance:
 
 ```cmake
@@ -348,6 +367,8 @@ install(FILES ${CMAKE_CURRENT_BINARY_DIR}/config.h
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/ross)
 ```
 
+   The `risa` exclude is defensive — Step 0 already disabled the `add_subdirectory(risa)` path so the headers are unused, but keep the exclude so a future re-enable doesn't accidentally start shipping risa headers without a deliberate decision.
+
    Keep the filename `config.h`. Once the `/ross/` subdir isolates the include namespace, the generic name is no longer a collision risk — the file now lives at `<prefix>/include/ross/config.h`, not `<prefix>/include/config.h`.
 
    Consumers do `#include <ross.h>`, which resolves via the exported target's `${CMAKE_INSTALL_INCLUDEDIR}/ross` interface include dir. Internal headers use `#include "config.h"` (quoted) — which resolves via the including header's own directory, so the installed `ross-base.h` at `<prefix>/include/ross/ross-base.h` finds `<prefix>/include/ross/config.h` without any source edits.
@@ -390,6 +411,8 @@ Cflags: -I${includedir}
 
 **Compat**: existing codes builds keep working — only the include path changes from `<prefix>/include` to `<prefix>/include/ross`, and codes consumes that via `${ROSS_INCLUDE_DIRS}` so it's transparent.
 
+**Intent — pkg-config is back-compat only.** `Cflags`/`Libs` deliberately omit MPI flags. ROSS and CODES both require MPI today and consumers compile with `mpicc` (or equivalent), so MPI gets pulled in transparently — adding `MPI_C_COMPILE_FLAGS`/`MPI_C_LIBRARIES` to `ross.pc` is unnecessary churn. The CMake config (Step 5) handles MPI properly via `find_dependency(MPI)`. The long-term direction is to deprecate `ross.pc` once downstream consumers (CODES first) migrate to `find_package(ross CONFIG)`; until then, keep `ross.pc` minimal and working. Don't invest in MPI-in-pkg-config or MPI-as-optional support here — both are far-future concerns.
+
 ---
 
 ### Step 8 — `include(GNUInstallDirs)` and replace hard-coded `lib/`/`bin/`/`include/`
@@ -397,6 +420,8 @@ Cflags: -I${includedir}
 **Files**: top-level `CMakeLists.txt`, `core/CMakeLists.txt`, `models/phold/CMakeLists.txt`
 
 **Change**: add `include(GNUInstallDirs)` near the top of the top-level file (after `project()`). Replace every `DESTINATION lib`, `DESTINATION bin`, `DESTINATION include` with `${CMAKE_INSTALL_LIBDIR}`, `${CMAKE_INSTALL_BINDIR}`, `${CMAKE_INSTALL_INCLUDEDIR}` respectively.
+
+**Also fix the RPATH stanza** at [CMakeLists.txt:35-37](CMakeLists.txt#L35-L37) — it hard-codes `${CMAKE_INSTALL_PREFIX}/lib` in both the `LIST(FIND ... isSystemDir)` check and the `SET(CMAKE_INSTALL_RPATH ...)` line. After `include(GNUInstallDirs)`, change both to `${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBDIR}` so multilib (lib64) installs get the correct install RPATH. This is a different construction than `DESTINATION lib` and won't be caught by the sweep above.
 
 **Why**: respects multilib systems (`lib64` on RHEL/Fedora) and lets distributions/Spack/superbuilds override per-component install dirs.
 
@@ -450,7 +475,9 @@ Explicit listing is preferred — there are only 1-2 models in tree.
 
 **File**: `models/phold/CMakeLists.txt`
 
-**Change**: replace the three-way `BGPM`/`USE_DAMARIS`/plain link-library branch at [models/phold/CMakeLists.txt:23-38](models/phold/CMakeLists.txt#L23-L38) with namespaced equivalents. Each branch must still be preserved — don't silently drop `imp_bgpm` or `ROSS_Damaris` linkage:
+**Phase**: this step is **Phase 1** (moved from Phase 3). It must land in the same PR as Step 2 because Step 2's removal of `${ROSS_BINARY_DIR}` invalidates the raw-path install at [models/phold/CMakeLists.txt:58](models/phold/CMakeLists.txt#L58).
+
+**Change**: replace the `BGPM` / plain link-library branches at [models/phold/CMakeLists.txt:23-38](models/phold/CMakeLists.txt#L23-L38) with the namespaced loop below. The Damaris branch is gone (Step 0 removed `USE_DAMARIS`):
 
 ```cmake
 set(phold_targets
@@ -463,9 +490,6 @@ foreach(t ${phold_targets})
     if(BGPM)
         target_link_libraries(${t} PRIVATE imp_bgpm)
     endif()
-    if(USE_DAMARIS)
-        target_link_libraries(${t} PRIVATE ROSS_Damaris)
-    endif()
 endforeach()
 ```
 
@@ -477,9 +501,9 @@ install(TARGETS ${phold_targets}
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 ```
 
-**Why**: dogfoods the new target. If models build via `add_subdirectory()` they use the alias; if they build standalone against an installed ROSS they `find_package(ross CONFIG)`.
+**Why**: dogfoods the new target. If models build via `add_subdirectory()` they use the alias; if they build standalone against an installed ROSS they `find_package(ross CONFIG)`. And — load-bearing — without this step, Step 2 leaves an `INSTALL(FILES ...)` line that references an empty variable.
 
-**Compat**: keep the `add_library(ROSS ALIAS ross)` shim from step 2 if you want to land step 11 separately or if other tests still reference `ROSS`.
+**Compat**: keep the `add_library(ROSS ALIAS ross)` shim from step 2 in case anything else (e.g., out-of-tree models) still references the bare `ROSS` name. The shim is cheap; remove it in a follow-up after a soak period.
 
 ---
 
@@ -577,13 +601,18 @@ endif()
 
 ## Sequencing recommendation
 
-- **Phase 1 (export story)**: Steps 1, 2, 3, 4, 5, 6, 7. After phase 1, codes can migrate from pkg-config to `find_package(ross CONFIG REQUIRED)` cleanly. Keep both pkg-config AND CMake config paths working.
+- **Phase 0 (pre-flight)**: Step 0 (disable Damaris/RISA). Land first, in its own PR.
+- **Phase 1 (export story)**: Steps 1, 2, 3, 4, 5, 6, 7, **11**. After phase 1, codes can migrate from pkg-config to `find_package(ross CONFIG REQUIRED)` cleanly. Keep both pkg-config AND CMake config paths working.
 - **Phase 2 (correctness/portability)**: Steps 8, 9, 13, 14.
-- **Phase 3 (polish/dogfood)**: Steps 10, 11, 12, 15, 16.
+- **Phase 3 (polish/dogfood)**: Steps 10, 12, 15, 16.
 
-Each phase is independently shippable; Phase 1 alone unblocks the user's stated priority.
+Each phase is independently shippable; Phase 1 unblocks the user's stated priority.
 
-**PR granularity within Phase 1**: Steps 3/5/6/7 should land together in a single PR (separate commits are fine for review). Step 3's `INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/ross` commits to the Step 6 install layout, and Step 7's pkg-config `includedir` must match both. Splitting them across PRs produces intermediate states where the exported target points at an include dir that doesn't exist yet. Steps 1, 2, 4 can each go in their own PR.
+**PR granularity within Phase 1**:
+- Steps **2 + 11** must land together — Step 2 deletes `${ROSS_BINARY_DIR}` (via the nested-project removal), which Step 11 replaces with `install(TARGETS ...)`. Splitting them leaves a broken install line referencing an empty variable.
+- Steps **3 / 5 / 6 / 7** must also land together (separate commits are fine for review). Step 3's `INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/ross` commits to the Step 6 install layout, and Step 7's pkg-config `includedir` must match both. Splitting them across PRs produces intermediate states where the exported target points at an include dir that doesn't exist yet.
+- Steps 1 and 4 can each go in their own PR.
+- Pragmatic option: bundle the entire Phase 1 (Steps 1, 2, 3, 4, 5, 6, 7, 11) into a single PR with one commit per step. The interdependencies are tight enough that staged review across multiple PRs costs more than it gains.
 
 ## Validation strategy
 
