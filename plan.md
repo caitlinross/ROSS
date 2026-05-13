@@ -88,7 +88,7 @@ From `/Users/caitlin.ross/projects/digital-twin/software/codes/CMakeLists.txt`:
    - MPI: codes runs its own `find_package(MPI)` via `SetupMPI.cmake`, then `include_directories(${MPI_C_INCLUDE_PATH})` and links `${MPI_C_LIBRARIES}`. Duplicates ROSS's own MPI handling.
    - Compile flags (e.g. `-D_GNU_SOURCE`) ROSS adds.
 4. **Compatibility surface to preserve** when migrating:
-   - `${ROSS_INCLUDE_DIRS}` variable (used in `src/` and `tests/`) — the new `rossConfig.cmake` should still set this for back-compat.
+   - `${ROSS_INCLUDE_DIRS}` variable (used in `src/` and `tests/`) — important caveat: CODES gets this from `pkg_check_modules` (auto-set from pkg-config output), NOT from `rossConfig.cmake`. So as long as CODES keeps using pkg-config, `${ROSS_INCLUDE_DIRS}` keeps working transparently regardless of what the CMake config does. If/when CODES migrates to `find_package(ross)`, it should switch from `${ROSS_INCLUDE_DIRS}` to the imported target `ross::ross` (which carries the include dirs via `INTERFACE_INCLUDE_DIRECTORIES`). The new canonical `rossConfig.cmake` deliberately does NOT set this variable — see Step 5 "Why no `ROSS_LIBRARIES` / `ROSS_INCLUDE_DIRS` / `ROSS_FOUND`."
    - The `ross::ross` (or `ROSS::ROSS`) imported target.
    - Continue producing a working `ross.pc` so that codes can keep using the pkg-config flow until codes is also migrated.
 
@@ -121,7 +121,57 @@ From `/Users/caitlin.ross/projects/digital-twin/software/codes/CMakeLists.txt`:
 
 ## Part 4 — Step-by-step modernization plan
 
-The plan is ordered: do the export-system changes first (steps 1–6), then quality improvements (7–12), then cleanups (13+). Each step is independently mergeable and testable against `codes`.
+The plan is ordered: pre-flight CI restoration first (its own PR), then export-system changes (steps 1–6), then quality improvements (7–12), then cleanups (13+). Each step is independently mergeable and testable against `codes`.
+
+---
+
+### Pre-flight Step CI — Minimal CI restoration (lands as PR 1, before all CMake work)
+
+**Files**: new `.github/workflows/build.yml`; delete `.travis.yml`
+
+**Context**: ROSS's existing CI is dead. The `.travis.yml` config has been non-functional for years due to a cocktail of ecosystem changes:
+- Travis ended free OSS builds in late 2020 (credit-limit changes).
+- Ubuntu Trusty (`dist: trusty`) was dropped from Travis in 2022.
+- The codecov bash uploader (`bash <(curl -s https://codecov.io/bash)`) was deprecated.
+- MPICH renamed from `mpich2` → `mpich` ~2013, so `travis-install-mpi.sh mpich2` was broken even before the rest of the stack rotted.
+- The `GH_TOKEN` driving the doc auto-publish to `ross-org.github.io` is almost certainly stale.
+
+Multi-step CMake work benefits from automated regression detection. Restoring CI before the refactor lets every subsequent PR run against a known-good baseline. Scope here is deliberately minimal — comprehensive CI (multi-platform, multiple MPI implementations, coverage, doc publishing) is in [future-refactor-tasks.md](future-refactor-tasks.md).
+
+**Changes**:
+1. **Delete `.travis.yml`** — actively misleading (looks like CI exists when it hasn't worked in years).
+2. **Add `.github/workflows/build.yml`** with a single Ubuntu + MPICH job that configures, builds, and runs `ctest`:
+
+```yaml
+name: build
+on:
+  push:
+    branches: [master, cmake-improvements]
+  pull_request:
+    branches: [master]
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install MPICH
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mpich libmpich-dev
+      - name: Configure
+        run: cmake -S . -B build -DROSS_BUILD_MODELS=ON -DCMAKE_BUILD_TYPE=Debug
+      - name: Build
+        run: cmake --build build -j
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+```
+
+3. **Verify green on `master`** before starting any CMake work. If master doesn't pass, fix master first (probably small Trusty-era assumptions surfaced by Ubuntu 24.04).
+4. **After Phase 1 lands**, update the workflow's `Configure` step to use `cmake --preset ross-debug` instead of manual flags. One-line change.
+
+**Why minimal scope here**: this PR is a regression-detection enabler, not the comprehensive CI rebuild. Adding macOS, OpenMPI, compiler matrix, and coverage now would balloon the PR and delay the actual CMake work. Each of those is a small follow-up PR after the CMake refactor lands.
+
+**Compat**: codes / downstream consumers are not affected — this PR only touches CI infrastructure inside the ROSS repo.
 
 ---
 
@@ -138,6 +188,60 @@ The plan is ordered: do the export-system changes first (steps 1–6), then qual
 4. Update [CLAUDE.md](CLAUDE.md) "Optional subsystems" — remove the Damaris/RISA bullet, note that Damaris is removed pending future cleanup of the C source paths.
 
 **Why**: the rest of the plan (especially Steps 6 and 11) had carve-outs for Damaris/RISA. Doing this first makes those carve-outs disappear and shrinks the plan's surface area. The `USE_DAMARIS=ON` case in Step 6 (risa header install) is no longer a question.
+
+---
+
+### Step 0b — Pre-flight: remove the Coveralls coverage tracking path
+
+**Files**: top-level `CMakeLists.txt`, `core/CMakeLists.txt`, delete `core/cmake/Coveralls.cmake`, `core/cmake/CoverallsClear.cmake`, `core/cmake/CoverallsGenerateGcov.cmake`
+
+**Context**: same pattern as Step 0 — delete a dead subsystem so subsequent steps don't have to reason about it. Three independent reasons to do this now:
+
+1. **The CI that drove it is gone.** The COVERALLS option exists to produce `coveralls.json` output for upload to coveralls.io. The Travis CI flow that called `make coveralls` is non-functional (see Pre-flight Step CI). The new minimal GHA workflow does not collect coverage. So `COVERALLS=ON` is unreachable from any automation today.
+2. **Step 2 silently breaks it.** [core/cmake/Coveralls.cmake:34](core/cmake/Coveralls.cmake#L34) does `set(_CMAKE_SCRIPT_PATH ${PROJECT_SOURCE_DIR}/cmake)`. Today this accidentally works because the nested `PROJECT(ROSS C)` in `core/` makes `${PROJECT_SOURCE_DIR}` = `core/`, so `${PROJECT_SOURCE_DIR}/cmake` = `core/cmake/` where the helper files live. After Step 2 removes the nested `project()`, `${PROJECT_SOURCE_DIR}` reverts to the top-level source dir and the path resolves to `<repo-root>/cmake/`, which doesn't exist. Coveralls then errors with `FATAL_ERROR "Coveralls: Missing ..."`.
+3. **Global flag mutation conflicts with Step 13.** The `coveralls_turn_on_coverage()` macro at [core/cmake/Coveralls.cmake:122-123](core/cmake/Coveralls.cmake#L122-L123) appends to `CMAKE_C_FLAGS` and `CMAKE_CXX_FLAGS` globally (the CXX one is dead code — CXX isn't enabled). Step 13 is moving everything to target-scoped options; leaving Coveralls as a global-flag-mutating outlier is inconsistent.
+
+The minimum fix to keep coverage working would be: rebase `_CMAKE_SCRIPT_PATH` on `${CMAKE_CURRENT_LIST_DIR}` (Coveralls.cmake's own location), convert the macro to apply `target_compile_options` + `target_link_options` to `ross`, and re-add coverage to the new GHA workflow with `codecov-action` instead of the deprecated bash uploader. That's real work for a feature nobody is using.
+
+**Changes**:
+1. Delete `option(COVERALLS ...)` and the `if(COVERALLS) include(Coveralls); coveralls_turn_on_coverage(); endif()` block at top-level [CMakeLists.txt:43-48](CMakeLists.txt#L43-L48).
+2. Delete the `if(COVERALLS) ... coveralls_setup(...) endif()` block at [core/CMakeLists.txt:157-167](core/CMakeLists.txt#L157-L167).
+3. Delete `core/cmake/Coveralls.cmake`, `core/cmake/CoverallsClear.cmake`, `core/cmake/CoverallsGenerateGcov.cmake`.
+4. No CLAUDE.md update needed — Coveralls isn't mentioned there.
+
+**Why**: dead subsystem, latent break, and inconsistency with Step 13. Re-enabling coverage later is straightforward — see "CI re-establishment (comprehensive)" in [future-refactor-tasks.md](future-refactor-tasks.md). The modern path is `target_compile_options(ross PRIVATE --coverage)` plus `target_link_options(ross PRIVATE --coverage)` plus a `codecov/codecov-action@v4` step in GHA, which is shorter than the existing BLT macro.
+
+**Compat**: `cmake -DCOVERALLS=ON ...` invocations now produce an "unknown option" warning (CMake does not error on unknown cache variables, just ignores them). Acceptable since no working CI ever passes this flag.
+
+**Audit note (docs/CMakeLists.txt)**: also audited as part of review item #6. Uses `${CMAKE_BINARY_DIR}` and `${CMAKE_CURRENT_SOURCE_DIR}` (always-valid globals), not `${ROSS_SOURCE_DIR}` / `${ROSS_BINARY_DIR}`. Unaffected by Step 2. No changes needed.
+
+---
+
+### Step 0c — Pre-flight: delete the `ross-config` shell-script wrapper
+
+**Files**: delete `core/ross-config.in`; modify `core/CMakeLists.txt`
+
+**Context**: `ross-config` is a hand-rolled shell script (`@ROSS_CC@`, `@CMAKE_INSTALL_PREFIX@` substituted at configure time) that prints flags for consumers — `--cflags`, `--ldflags`, `--libs`, `--cc`, `--cxx`, `--ld`. It's the same pattern as historic `mpicc --show`, `gtk-config`, `wx-config`: a custom script that pre-dates standard discovery mechanisms.
+
+It is fully redundant with the two discovery surfaces this plan establishes:
+- **pkg-config users** get the same flags via `pkg-config --cflags ross` / `--libs ross` (Step 7 modernizes `ross.pc`).
+- **CMake users** get them via `find_package(ross)` + `target_link_libraries(... ross::ross)` (Step 5).
+
+**Decision: delete it.** Grep across the active consumer repos was conclusive: **zero references in CODES, zero in NetMaestro**, zero anywhere in ROSS itself except the script's own definition and CMake plumbing. Nobody uses it.
+
+**Changes**:
+1. Delete `core/ross-config.in`.
+2. Delete the lines that set up and install it in `core/CMakeLists.txt` (currently around lines 177-187):
+   - `SET(ROSS_CC $ENV{CC})` and `SET(ROSS_CXX $ENV{CXX})` (purpose was to feed the script's template substitution)
+   - `STRING(REPLACE " " "\\ " CMAKE_INSTALL_PREFIX_ESCAPED "\"${CMAKE_INSTALL_PREFIX}\"")` if it's only used by `ross-config.in` — note `ross.pc.in` also uses `@CMAKE_INSTALL_PREFIX_ESCAPED@` today; Step 7 rewrites `ross.pc.in` to use `@CMAKE_INSTALL_PREFIX@` directly, so this line goes away then anyway. Don't delete it in Step 0c if Step 7 isn't landing in the same PR; deletion order doesn't matter as long as both happen.
+   - `CONFIGURE_FILE(ross-config.in ross-config @ONLY)`
+   - `SET_SOURCE_FILES_PROPERTIES(...ross-config.in... GENERATED FALSE)` and `...ross-config GENERATED TRUE)`
+   - `INSTALL(FILES ${ROSS_BINARY_DIR}/ross-config DESTINATION bin PERMISSIONS ...)` — the bin install rule
+3. No CLAUDE.md update needed — `ross-config` isn't mentioned there.
+
+**Why**: dead infrastructure with two modern replacements already in scope. Carrying a third discovery surface (`ross-config`) through the modernization means three things to keep in sync. Deleting it now removes a per-PR maintenance cost from every subsequent step.
+
+**Compat**: any consumer script that previously called `ross-config --cflags` etc. would break — but the grep across CODES / NetMaestro / ROSS itself confirmed zero such callers. If a surprise out-of-tree consumer turns up post-merge, the migration is `pkg-config --cflags ross` (literally one word swap).
 
 ---
 
@@ -182,7 +286,9 @@ Lower-case `ross` as the project name is the modern convention (the package name
 
 **Regression risk to watch**: `git_describe_working_tree` returns empty on tarball builds / shallow clones / tag-less trees. The current code tolerates empty version strings (they just leak into `ross.pc` as blanks); `project(VERSION ...)` does NOT — it errors. The fallback above is load-bearing, not cosmetic.
 
-**Compat**: any consumer using `find_package(ROSS)` (uppercase) still works — CMake's `find_package` is case-insensitive on the package name; the config file naming changes (see step 4) but we'll ship both `rossConfig.cmake` and a back-compat shim.
+**Compat**: `find_package(ROSS)` (uppercase) is **not** automatically equivalent to `find_package(ross)` — that earlier claim was wrong. CMake searches for `<Name>Config.cmake` using the exact case the caller provides (it does also try a `<lowercase-name>-config.cmake` fallback, but we ship the camelcase `rossConfig.cmake`, not the dashed variant). So `find_package(ROSS)` would not find the new canonical install at `<prefix>/lib/cmake/ross/rossConfig.cmake`.
+
+External users could plausibly be calling `find_package(ROSS)` against the current master install (which ships `<prefix>/lib/ROSSConfig.cmake` and requires a `-DROSS_DIR=<prefix>/lib` hint). To keep them working through one deprecation cycle, Step 5 ships a back-compat shim at the **old** install location (`<prefix>/lib/ROSSConfig.cmake`) that emits a DEPRECATION message and delegates to the new config. See Step 5 item 4 for the full shim contents.
 
 ---
 
@@ -196,21 +302,28 @@ Lower-case `ross` as the project name is the modern convention (the package name
    - `core/CMakeLists.txt`: `${ROSS_SOURCE_DIR}` → `${CMAKE_CURRENT_SOURCE_DIR}`, `${ROSS_BINARY_DIR}` → `${CMAKE_CURRENT_BINARY_DIR}`. Affects [core/CMakeLists.txt:2,187-193](core/CMakeLists.txt#L2-L193) (the directory-scope include — about to be replaced by Step 3 anyway — and four `INSTALL(...)` lines).
    - `models/phold/CMakeLists.txt`: delete `INCLUDE_DIRECTORIES(${ROSS_SOURCE_DIR} ...)` and `INCLUDE_DIRECTORIES(${ROSS_BINARY_DIR})` outright at [models/phold/CMakeLists.txt:1-9](models/phold/CMakeLists.txt#L1-L9) — Step 3's `BUILD_INTERFACE` propagation via `ross::ross` covers them. The raw-path install at [models/phold/CMakeLists.txt:58](models/phold/CMakeLists.txt#L58) is replaced in Step 11.
    - **This forces Step 11 into the same PR as Step 2** (or sooner). Without Step 11's `install(TARGETS ${phold_targets} ...)` rewrite, the broken `${ROSS_BINARY_DIR}/../models/phold/phold` install path remains. See the updated Phase 1 sequencing.
-3. Rename the target. Keep the library file output name `ROSS` (so `libROSS.a` stays, preserving pkg-config's `-lROSS`), but use target name `ross` so we can do the modern alias dance:
+3. Rename the target and commit to lowercase end-to-end. CMake's default `OUTPUT_NAME` equals the target name, so `add_library(ross ...)` produces `libross.{a,so}` automatically. No `OUTPUT_NAME` property needed:
 
 ```cmake
 add_library(ross ${ross_srcs})
-add_library(ross::ross ALIAS ross)
+add_library(ross::ross ALIAS ross)              # namespaced consumer target
+add_library(ROSS      ALIAS ross)               # back-compat alias for in-tree bare-target callers
 set_target_properties(ross PROPERTIES
-    OUTPUT_NAME ROSS                     # preserves libROSS.a / libROSS.so
-    EXPORT_NAME ross)                    # exports as ross::ross via namespace
+    EXPORT_NAME ross)                            # exports as ross::ross via namespace
 ```
+
+   **Library filename rename — `libROSS.{a,so}` → `libross.{a,so}`.** This is a deliberate consistency change: lowercase package name (`find_package(ross)`), lowercase pkg-config (`ross.pc`), lowercase namespaced target (`ross::ross`), lowercase library file. The on-disk filename is the only remaining uppercase artifact today; collapsing it removes the asymmetry. Grep across CODES, NetMaestro, and ROSS itself before deciding showed:
+   - Zero source-tree references to `-lROSS` or `libROSS` in CODES (the hits in `test/build.ninja` and `CMakeCache.txt` are auto-regenerated build artifacts that pick up the new name on reconfigure).
+   - Zero references in NetMaestro.
+   - The two committed ROSS-side references (`core/ross-config.in:45`, `core/ross.pc.in:5`) are already handled — `ross-config.in` is deleted in Step 0c, and `ross.pc.in` is rewritten in Step 7 with the new lowercase flag.
+
+   No consumer-side source changes required. Anyone using pkg-config or `find_package(ross)` picks up `-lross` / `libross.a` transparently on reconfigure.
 
 4. Convert `TARGET_LINK_LIBRARIES(ROSS ${ROSS_EXTERNAL_LIBS})` to keyword form (see steps 3 and 5).
 
-**Why**: gives us a namespaced target without breaking the on-disk library filename. Models can later switch from `target_link_libraries(phold ROSS m)` to `target_link_libraries(phold PRIVATE ross::ross m)`. A back-compat alias `add_library(ROSS ALIAS ross)` should also be added so existing in-tree consumers keep working through the transition.
+**Why**: gives us a namespaced target AND finishes the lowercase consistency story. End-to-end one mental model: `ross` is the package name, library file, find_package name, pkg-config name, and namespaced target.
 
-**Compat**: the in-tree `models/phold/CMakeLists.txt` still uses bare `ROSS` — add `add_library(ROSS ALIAS ross)` so it keeps working until step 11.
+**Compat**: the in-tree `models/phold/CMakeLists.txt` still uses bare `ROSS` — `add_library(ROSS ALIAS ross)` keeps it working until Step 11 migrates it to `ross::ross`. The alias is on the *target* name, independent of the library filename — it stays valid regardless of the `libROSS.a` → `libross.a` rename.
 
 ---
 
@@ -236,11 +349,13 @@ Note the `/ross` subdirectory in the install interface. Headers will move (step 
 
 ### Step 4 — Stop leaking absolute MPI paths into the exported target; depend on `MPI::MPI_C`
 
-**Files**: `CMakeLists.txt` (top level), `core/cmake/SetupMPI.cmake`, `core/CMakeLists.txt`
+**Files**: `CMakeLists.txt` (top level), `core/CMakeLists.txt`, delete `core/cmake/SetupMPI.cmake`, [CLAUDE.md](CLAUDE.md)
+
+**Configure-time UX (the point of this step)**: after this step, users configure ROSS with their system C compiler — `cmake --preset ross-debug` or `cmake -S . -B build -DROSS_BUILD_MODELS=ON -DCMAKE_BUILD_TYPE=Debug`. **No `CC=mpicc` and no `-DCMAKE_C_COMPILER=mpicc` required.** CMake's `find_package(MPI REQUIRED COMPONENTS C)` does the discovery (typically by locating `mpicc` on PATH and inspecting it) and exposes everything via `MPI::MPI_C`. If MPI is installed in a non-standard location, users hint with `-DMPI_HOME=...` or `module load <mpi>` — never by overriding the C compiler.
 
 **Changes**:
-1. In `SetupMPI.cmake` (or replace with a direct `find_package(MPI REQUIRED COMPONENTS C)` in top-level), drop the `MPI_C_INCLUDE_PATH` / `MPI_C_LIBRARIES` style; rely on `MPI::MPI_C`.
-2. In top-level `CMakeLists.txt`, delete `INCLUDE_DIRECTORIES(${MPI_C_INCLUDE_PATH})` and `LIST(APPEND ROSS_EXTERNAL_LIBS ${MPI_C_LIBRARIES})`.
+1. **Delete** [core/cmake/SetupMPI.cmake](core/cmake/SetupMPI.cmake). It's BLT-derived legacy that wraps `find_package(MPI)` and dumps legacy `MPI_C_*` variables — nothing in modern CMake needs it. Replace the `INCLUDE(SetupMPI)` call at [CMakeLists.txt:149](CMakeLists.txt#L149) with `find_package(MPI REQUIRED COMPONENTS C)` directly. The `REQUIRED` keyword turns the current "WARNING: Could not find MPI!" soft-fail (lines 153-157) into a hard configure-time error, which is correct — ROSS does not build without MPI.
+2. In top-level `CMakeLists.txt`, delete `INCLUDE_DIRECTORIES(${MPI_C_INCLUDE_PATH})` and `LIST(APPEND ROSS_EXTERNAL_LIBS ${MPI_C_LIBRARIES})` (lines 150-157, the whole `IF(MPI_C_FOUND) ... ELSE ... ENDIF` block).
 3. In `core/CMakeLists.txt`:
 ```cmake
 target_link_libraries(ross
@@ -249,10 +364,47 @@ target_link_libraries(ross
 ```
    MPI must be `PUBLIC`, not `PRIVATE`: [core/ross.h:81](core/ross.h#L81) does `#include <mpi.h>`, and `ross.h` is the primary public header. `ross-gvt.h` and `network-mpi.h` also include it.
 4. Delete `TARGET_INCLUDE_DIRECTORIES(ROSS INTERFACE ${MPI_C_INCLUDE_PATH})`.
+5. **Update [CLAUDE.md](CLAUDE.md)**: drop `-DCMAKE_C_COMPILER=mpicc` from the manual configure example in the "Build" section. Add a one-liner that says "MPI is auto-discovered; for non-standard install locations use `-DMPI_HOME=...` or `module load`." This documentation change is load-bearing because the existing docs are how users learn the workflow.
 
-**Why**: `MPI::MPI_C` is a properly-named imported target. When we export the package config and add `find_dependency(MPI COMPONENTS C)`, the consumer's CMake re-resolves MPI on its own machine. **This is the single most important change for relocatability.**
+**Why**: `MPI::MPI_C` is a properly-named imported target. When we export the package config and add `find_dependency(MPI COMPONENTS C)`, the consumer's CMake re-resolves MPI on its own machine. **This is the single most important change for relocatability**, and the side effect — that users no longer need to know they should set `CC=mpicc` — is also the right end-state. The wrapper-compiler workflow was a workaround for the old MPI-by-legacy-variable style; modern CMake replaces it entirely.
 
-**Compat**: `codes` currently runs its own `find_package(MPI)` — fine, no break. After codes migrates to `find_package(ross CONFIG)`, codes can drop its own MPI block since it'll get `MPI::MPI_C` transitively.
+**Compat**: `codes` currently runs its own `find_package(MPI)` — fine, no break. After codes migrates to `find_package(ross)`, codes can drop its own MPI block since it'll get `MPI::MPI_C` transitively.
+
+---
+
+### Step 4b — Honor `BUILD_SHARED_LIBS` directly; retire `ROSS_BUILD_SHARED_LIBS`
+
+**Files**: `core/CMakeLists.txt`, [CLAUDE.md](CLAUDE.md)
+
+**Problem**: [core/CMakeLists.txt:150-151](core/CMakeLists.txt#L150-L151) defines a custom `ROSS_BUILD_SHARED_LIBS` option that maps to the standard `BUILD_SHARED_LIBS`:
+```cmake
+OPTION(ROSS_BUILD_SHARED_LIBS "Build shared libraries instead of static" OFF)
+SET(BUILD_SHARED_LIBS ${ROSS_BUILD_SHARED_LIBS})
+```
+This is wrong on three counts:
+- Two knobs for one decision — `BUILD_SHARED_LIBS` is the standard, discoverable CMake variable; nobody guesses `ROSS_BUILD_SHARED_LIBS`.
+- `set(BUILD_SHARED_LIBS ...)` (without `CACHE`) shadows the parent project when ROSS is `add_subdirectory`'d, silently producing a static `libross.a` inside a shared-by-default superbuild.
+- It's not how modern CMake projects handle this.
+
+**Changes**:
+1. Delete the `OPTION(ROSS_BUILD_SHARED_LIBS ...)` and the `SET(BUILD_SHARED_LIBS ...)` line. The `add_library(ross ${ross_srcs})` from Step 2 then defers to the standard `BUILD_SHARED_LIBS` (default static when unset).
+2. Add a one-release deprecation shim at the top of `core/CMakeLists.txt`, same pattern as Step 15:
+```cmake
+if(DEFINED ROSS_BUILD_SHARED_LIBS)
+    message(DEPRECATION
+        "ROSS_BUILD_SHARED_LIBS is deprecated; use the standard "
+        "BUILD_SHARED_LIBS variable (-DBUILD_SHARED_LIBS=ON).")
+    if(NOT DEFINED BUILD_SHARED_LIBS)
+        set(BUILD_SHARED_LIBS ${ROSS_BUILD_SHARED_LIBS} CACHE BOOL "" FORCE)
+    endif()
+endif()
+```
+Remove the shim in a follow-up release after a soak period.
+3. **Update [CLAUDE.md](CLAUDE.md)** — under "Build", add a one-liner: "Default is a static library. Pass `-DBUILD_SHARED_LIBS=ON` to build shared."
+
+**Why**: standard CMake variable, one knob, superbuild-friendly (`add_subdirectory` consumers inherit the parent's setting), self-documenting. `CMAKE_POSITION_INDEPENDENT_CODE ON` at the top of the top-level `CMakeLists.txt` stays — required so a static ROSS can be linked into downstream shared objects (e.g., Python bindings). The `install(TARGETS ross ... LIBRARY/ARCHIVE/RUNTIME DESTINATION ...)` form from Step 5 already handles both modes via its three destination keywords; no install-side change needed here.
+
+**Compat**: scripts or build systems that pass `-DROSS_BUILD_SHARED_LIBS=ON` get a deprecation warning and continue to work (the shim maps it to `BUILD_SHARED_LIBS`). After one release, the shim goes away and they need to switch to `-DBUILD_SHARED_LIBS=ON`.
 
 ---
 
@@ -269,18 +421,38 @@ target_link_libraries(ross
 ```cmake
 @PACKAGE_INIT@
 
+# rossConfig.cmake — ROSS package configuration for find_package(ross)
+#
+# Usage:
+#     find_package(ross REQUIRED)
+#     target_link_libraries(myapp PRIVATE ross::ross)
+#
+# This is the modern CMake API: a namespaced imported target carries the
+# include dirs, link dependencies (MPI), and any compile definitions
+# transparently. No legacy <PKG>_LIBRARIES / <PKG>_INCLUDE_DIRS variables
+# are set — consumers should use the ross::ross target directly. If you
+# need the include path explicitly, query the target:
+#     get_target_property(dirs ross::ross INTERFACE_INCLUDE_DIRECTORIES)
+#
+# Path B consumer contract for headers:
+#     #include <ross.h>           — supported
+#     #include <ross-extern.h>    — supported (top-level ross-*.h)
+#     #include <instrumentation/...> — UNSUPPORTED (internal headers,
+#         reachable via BUILD_INTERFACE but may be hidden in a future
+#         release). See future-refactor-tasks.md "Header hygiene &
+#         public/internal split".
+
 include(CMakeFindDependencyMacro)
 find_dependency(MPI REQUIRED COMPONENTS C)
 
 include("${CMAKE_CURRENT_LIST_DIR}/rossTargets.cmake")
 
-# Back-compat variables for consumers still using the old discovery style
-set(ROSS_INCLUDE_DIRS "@PACKAGE_CMAKE_INSTALL_INCLUDEDIR@/ross")
-set(ROSS_LIBRARIES    ross::ross)
-set(ROSS_FOUND        TRUE)
-
 check_required_components(ross)
 ```
+
+**Why no `ROSS_LIBRARIES` / `ROSS_INCLUDE_DIRS` / `ROSS_FOUND` in the new config**: modern CMake convention (since ~3.x became common) is for package config files to expose only imported targets. Legacy `<PKG>_LIBRARIES`-style variables are pre-target-based-CMake conventions kept by `FindXxx.cmake` modules for compatibility, but new packages shouldn't ship them. Adding them speculatively (a) creates an "is `${ROSS_LIBRARIES}` a target name or a file path?" surprise, and (b) doesn't preserve any actual back-compat — master's hand-written `ROSSConfig.cmake` only set `ROSS_INCLUDE_DIRS`, and CODES (the only known consumer) gets that variable from pkg-config, not from rossConfig.cmake. CMake auto-sets `ross_FOUND` when find_package succeeds, so we don't need to set it either.
+
+If a true back-compat surface needs preserving, it lives in the uppercase shim — see item 4 below.
 
 2. In `core/CMakeLists.txt` replace the install block:
 ```cmake
@@ -323,24 +495,52 @@ export(EXPORT rossTargets
 
 3. Delete the old `core/ROSSConfig.cmake` file (or, for transition, overwrite it with a deprecation warning that includes the new config). Recommend full deletion.
 
-4. **Optional back-compat shim** for consumers that do `find_package(ROSS)`. Add a tiny installed file `<prefix>/lib/cmake/ROSS/ROSSConfig.cmake` that just `include`s the new one:
+4. **Back-compat shim for `find_package(ROSS)`** — ship it. Rationale: master currently installs `<prefix>/lib/ROSSConfig.cmake` (uppercase, non-canonical location), and external researchers may be using `find_package(ROSS)` with a `-DROSS_DIR=<prefix>/lib` hint. We can't audit who they are, the shim is ~10 lines, and the removal is already tracked in [future-refactor-tasks.md](future-refactor-tasks.md).
+
+   Install the shim at the **old** location `<prefix>/${CMAKE_INSTALL_LIBDIR}/ROSSConfig.cmake` (not `lib/cmake/ROSS/`) — that's the path legacy `-DROSS_DIR` hints point at. Contents:
+
 ```cmake
-message(DEPRECATION "find_package(ROSS) is deprecated; use find_package(ross CONFIG) and link ross::ross")
-include(${CMAKE_CURRENT_LIST_DIR}/../ross/rossConfig.cmake)
+# <prefix>/lib/ROSSConfig.cmake — deprecation shim
+message(DEPRECATION
+    "find_package(ROSS) (uppercase) and the <prefix>/lib install location are "
+    "deprecated. Use find_package(ross) and link against ross::ross. "
+    "This shim will be removed in a future ROSS release.")
+
+# Delegate discovery to the new canonical config
+include(${CMAKE_CURRENT_LIST_DIR}/cmake/ross/rossConfig.cmake)
+
+# Preserve the one variable master's hand-written ROSSConfig.cmake set.
+# The new canonical rossConfig.cmake intentionally does NOT set this
+# (modern CMake convention is imported-targets-only), but legacy callers
+# of find_package(ROSS) may use ${ROSS_INCLUDE_DIRS} directly. Derive it
+# from the imported target so it always matches the actual install path.
+get_target_property(_ross_inc_dirs ross::ross INTERFACE_INCLUDE_DIRECTORIES)
+set(ROSS_INCLUDE_DIRS ${_ross_inc_dirs})
+unset(_ross_inc_dirs)
+
+# Legacy bare-target-name compat: pre-modernization users wrote
+# target_link_libraries(myapp ROSS). The new install exports the target as
+# ross::ross; alias it back so old call sites keep linking.
+if(NOT TARGET ROSS)
+    add_library(ROSS ALIAS ross::ross)
+endif()
 ```
-   This is optional — only do this if there are external consumers we don't control.
+
+   This faithfully reproduces master's `<prefix>/lib/ROSSConfig.cmake` behavior (which set `ROSS_INCLUDE_DIRS` and nothing else) while delegating the actual implementation to the new modern config. Anyone using `find_package(ROSS)` + `${ROSS_INCLUDE_DIRS}` + bare `ROSS` target name keeps working through the deprecation cycle.
+
+   Install with a small `install(FILES ...)` rule alongside the main config install. Removal of this shim is tracked under "Deprecation shim removals" in [future-refactor-tasks.md](future-refactor-tasks.md).
 
 **Why**: this is the heart of the migration. After this, downstream code can do:
 ```cmake
-find_package(ross CONFIG REQUIRED)
+find_package(ross REQUIRED)
 target_link_libraries(myapp PRIVATE ross::ross)
 ```
 and get includes, MPI dependency, and all link libs propagated correctly.
 
 **Compat**:
 - Codes still works during transition because it uses pkg-config, not `find_package(ROSS)`. We keep `ross.pc` working (step 6).
-- The `ROSS_INCLUDE_DIRS` variable is still set by the new `rossConfig.cmake` — codes' `${ROSS_INCLUDE_DIRS}` references keep working when codes does eventually switch to `find_package(ross)`.
-- The case-sensitivity shim above handles `find_package(ROSS)`.
+- CODES's `${ROSS_INCLUDE_DIRS}` references in `src/` and `tests/` come from `pkg_check_modules` (which auto-sets the variable from pkg-config output), not from `rossConfig.cmake`. As long as CODES uses pkg-config, those references keep working transparently. When CODES eventually migrates to `find_package(ross)`, it should switch from `${ROSS_INCLUDE_DIRS}` to the imported target `ross::ross` — the include dirs ride along via `INTERFACE_INCLUDE_DIRECTORIES`. The new canonical `rossConfig.cmake` does not set the legacy variable.
+- The shim at the legacy `<prefix>/lib/ROSSConfig.cmake` location handles `find_package(ROSS)` with `-DROSS_DIR=<prefix>/lib`-style hints. New users use `find_package(ross)` against the canonical `<prefix>/lib/cmake/ross/` location.
 
 ---
 
@@ -377,7 +577,16 @@ install(FILES ${CMAKE_CURRENT_BINARY_DIR}/config.h
 
    **Alternative considered**: install to `include/` (top level) and require consumers use `#include <ross/ross.h>`. This is stricter but breaks all existing `#include <ross.h>` usage in codes and elsewhere. **Rejected** — not worth the source churn for consumers.
 
-**Why**: stops dumping `lz4.h`, `buddy.h`, `config.h`, `io.h`, `analysis-lp.h`, etc. directly into `<prefix>/include/`. Eliminates the pollution risk without requiring source edits to rename `config.h`.
+**Consumer contract — Path B**: external consumers may `#include <ross.h>` or any top-level `ross-*.h` header (e.g. `<ross-extern.h>`, `<ross-types.h>`). Subdirectory headers (`<instrumentation/...>`, `<check-revent/...>`, `<queue/...>`, `<rio/...>`) and internal headers (`<buddy.h>`, `<lz4.h>`, `<hash-quadratic.h>`) are **not** part of the supported surface — build-tree consumers can still reach them via the BUILD_INTERFACE include path, but this is an unsupported artifact and will be hidden when the public/private header split lands (see [future-refactor-tasks.md](future-refactor-tasks.md)).
+
+Path B matches what CODES already does: ~40 files use `#include <ross.h>`, plus 4 redundant `#include <ross-extern.h>` references in [src/surrogate/](../codes/src/surrogate/) that already work transparently because `ross.h` pulls in `ross-extern.h` via [core/ross.h:109](core/ross.h#L109). **No CODES source changes are required for the CMake PR.**
+
+Document the contract in three places as part of this step:
+- [CLAUDE.md](CLAUDE.md) — add a "Consumer-facing API surface" subsection under "Architecture" or near the "Consumer compatibility (CODES)" section.
+- A comment block at the top of the new `core/cmake/rossConfig.cmake.in` (introduced in Step 5).
+- This step's prose above (already covered).
+
+**Why**: stops dumping `lz4.h`, `buddy.h`, `config.h`, `io.h`, `analysis-lp.h`, etc. directly into `<prefix>/include/`. Eliminates the pollution risk without requiring source edits to rename `config.h`. The Path B contract also lets the build-tree/install-tree asymmetry (build-tree exposes more headers than install-tree) be characterized as "build-tree exposes unsupported internals" rather than "build-tree and install-tree disagree about the API," which is much weaker.
 
 **Earlier draft had a `RENAME config.h → ross-config-build.h` step** — removed. That rename was incomplete ([core/ross-base.h:6](core/ross-base.h#L6) and [core/ross-random.h:4](core/ross-random.h#L4) both `#include "config.h"`; only updating `.c` files would have left the installed headers broken) and unnecessary once the `/ross/` subdir namespacing is in place.
 
@@ -402,7 +611,7 @@ Name: ross
 Description: Rensselaer's Optimistic Simulation System
 URL: https://github.com/ROSS-org/ROSS
 Version: @PROJECT_VERSION@
-Libs: -L${libdir} -lROSS -lm
+Libs: -L${libdir} -lross -lm
 Cflags: -I${includedir}
 ```
 3. Install to `${CMAKE_INSTALL_LIBDIR}/pkgconfig`.
@@ -411,7 +620,7 @@ Cflags: -I${includedir}
 
 **Compat**: existing codes builds keep working — only the include path changes from `<prefix>/include` to `<prefix>/include/ross`, and codes consumes that via `${ROSS_INCLUDE_DIRS}` so it's transparent.
 
-**Intent — pkg-config is back-compat only.** `Cflags`/`Libs` deliberately omit MPI flags. ROSS and CODES both require MPI today and consumers compile with `mpicc` (or equivalent), so MPI gets pulled in transparently — adding `MPI_C_COMPILE_FLAGS`/`MPI_C_LIBRARIES` to `ross.pc` is unnecessary churn. The CMake config (Step 5) handles MPI properly via `find_dependency(MPI)`. The long-term direction is to deprecate `ross.pc` once downstream consumers (CODES first) migrate to `find_package(ross CONFIG)`; until then, keep `ross.pc` minimal and working. Don't invest in MPI-in-pkg-config or MPI-as-optional support here — both are far-future concerns.
+**Intent — pkg-config is back-compat only.** `Cflags`/`Libs` deliberately omit MPI flags. ROSS and CODES both require MPI today and consumers compile with `mpicc` (or equivalent), so MPI gets pulled in transparently — adding `MPI_C_COMPILE_FLAGS`/`MPI_C_LIBRARIES` to `ross.pc` is unnecessary churn. The CMake config (Step 5) handles MPI properly via `find_dependency(MPI)`. The long-term direction is to deprecate `ross.pc` once downstream consumers (CODES first) migrate to `find_package(ross)`; until then, keep `ross.pc` minimal and working. Don't invest in MPI-in-pkg-config or MPI-as-optional support here — both are far-future concerns.
 
 ---
 
@@ -447,6 +656,20 @@ endif()
 ```
 
 **Why**: makes ROSS embeddable via `add_subdirectory()` or `FetchContent_Declare` without hijacking the parent's testing/RPATH config. Useful for monorepo / superbuild integration.
+
+**Test gating after this step — clarification**: ROSS tests live in `models/phold/CMakeLists.txt` (via the `ROSS_TEST_SCHEDULERS` and `ROSS_TEST_INSTRUMENTATION` helpers defined in `models/CMakeLists.txt`). After Step 9, tests are gated by three independent conditions, all of which must hold for `ctest` to discover ROSS's tests:
+
+1. `PROJECT_IS_TOP_LEVEL` — Step 9's gate. When ROSS is consumed via `add_subdirectory()`, ROSS does NOT call `include(CTest)`; the parent project decides whether to enable testing. Tests don't get registered with ctest in subdirectory mode unless the parent has its own `enable_testing()`.
+2. `BUILD_TESTING=ON` — controls whether `include(CTest)` (which runs only when condition 1 holds at top level) calls `enable_testing()`. Defaults ON via the standard CTest module. Both presets explicitly set `BUILD_TESTING=ON`.
+3. `ROSS_BUILD_MODELS=ON` — controls whether [models/CMakeLists.txt](models/CMakeLists.txt) is added at all, which is where the test definitions live. Defaults OFF.
+
+Concretely:
+- Both ON at top level → tests run.
+- `BUILD_TESTING=OFF` at top level → models still build (if `ROSS_BUILD_MODELS=ON`), but `add_test(...)` calls inside `models/phold/CMakeLists.txt` are no-ops because `enable_testing()` was never called.
+- `ROSS_BUILD_MODELS=OFF` → no test definitions exist; CTest infrastructure is set up but empty.
+- Consumed via `add_subdirectory()` → ROSS skips `include(CTest)` entirely; tests only run if the parent project sets up CTest and `ROSS_BUILD_MODELS=ON`.
+
+This triple-gating is intentional, not a bug — models are opt-in (most consumers just want the library), and testing infrastructure is opt-in (CTest is heavy and shouldn't be forced on subdirectory consumers). The implementer of Step 9 should be aware that `PROJECT_IS_TOP_LEVEL` is layered ON TOP of the existing `BUILD_TESTING` / `ROSS_BUILD_MODELS` gates, not a replacement for them.
 
 ---
 
@@ -501,7 +724,7 @@ install(TARGETS ${phold_targets}
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 ```
 
-**Why**: dogfoods the new target. If models build via `add_subdirectory()` they use the alias; if they build standalone against an installed ROSS they `find_package(ross CONFIG)`. And — load-bearing — without this step, Step 2 leaves an `INSTALL(FILES ...)` line that references an empty variable.
+**Why**: dogfoods the new target. If models build via `add_subdirectory()` they use the alias; if they build standalone against an installed ROSS they `find_package(ross)`. And — load-bearing — without this step, Step 2 leaves an `INSTALL(FILES ...)` line that references an empty variable.
 
 **Compat**: keep the `add_library(ROSS ALIAS ross)` shim from step 2 in case anything else (e.g., out-of-tree models) still references the bare `ROSS` name. The shim is cheap; remove it in a follow-up after a soak period.
 
@@ -526,29 +749,68 @@ add_test(NAME ${target_name}_SCHED_Optimistic
 
 ---
 
-### Step 13 — Convert per-arch flags to target compile options + key on compiler
+### Step 13 — Convert per-arch flags to target compile options; gate IBM-XL flags on both arch AND compiler
 
 **File**: top-level `CMakeLists.txt`
 
-**Change**: stop appending to `CMAKE_C_FLAGS` globally. Use `target_compile_options(ross PRIVATE ...)` and key on `CMAKE_C_COMPILER_ID` for IBM-XL-specific flags:
+**The problem this step fixes**: today, the per-arch branches at [CMakeLists.txt:71-134](CMakeLists.txt#L71-L134) tangle two unrelated concerns (CLOCK selection — which file from `core/clock/` ships — and compiler flag injection) into one `if(CMAKE_SYSTEM_PROCESSOR ...)` chain, and the IBM-XL-specific flags (`-O5 -qprefetch=aggressive -qarch=pwr9`, etc.) are applied based on `CMAKE_SYSTEM_PROCESSOR` alone. That means **a ppc64le machine running gcc — the typical case today — has `-qarch=pwr9` and friends injected into gcc's command line, which gcc doesn't understand and errors on.** Same flaw on BGQ/BGP/BGL, but those are EOL hardware (no surviving builds anyone can validate against).
+
+Conservative approach — we keep all current arch branches with corrected gating rather than ripping out EOL paths we can't test deleting. Tracked as a future-refactor candidate for deletion once dead-path status is confirmed (see [future-refactor-tasks.md](future-refactor-tasks.md)).
+
+**Changes**:
+
+1. **Split the concerns.** CLOCK selection stays as `if(CMAKE_SYSTEM_PROCESSOR STREQUAL ...) set(CLOCK ...) endif()` chains — purely architecture-driven, independent of compiler. No structural change to this part.
+
+2. **Generic compile options** (`-g -Wall`, `-D_GNU_SOURCE`) move from `CMAKE_C_FLAGS`/`ADD_DEFINITIONS` into target-scoped properties applied unconditionally:
 ```cmake
-if(CMAKE_C_COMPILER_ID STREQUAL "XL" OR CMAKE_C_COMPILER_ID STREQUAL "XLClang")
+target_compile_options(ross PRIVATE -g -Wall)
+target_compile_definitions(ross PRIVATE _GNU_SOURCE)
+```
+
+3. **IBM-XL optimization flags** go in a separate block gated on **both** `CMAKE_C_COMPILER_ID` matching XL **and** the corresponding `CMAKE_SYSTEM_PROCESSOR`:
+```cmake
+if(CMAKE_C_COMPILER_ID MATCHES "^XL")
+    message(STATUS
+        "IBM XL compiler detected — applying legacy XL optimization flags. "
+        "These paths have not been validated against current hardware; "
+        "please report build success/failure.")
+
     if(CMAKE_SYSTEM_PROCESSOR STREQUAL "ppc64le")
-        target_compile_options(ross PRIVATE -O5 -qprefetch=aggressive -qarch=pwr9 ...)
+        target_compile_options(ross PRIVATE
+            -O5 -qprefetch=aggressive -qarch=pwr9 -qtune=auto
+            -qmaxmem=-1 -qsimd=noauto -qhot)
+    elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL "bgq")
+        target_compile_options(ross PRIVATE
+            -O5 -qstrict -qprefetch=aggressive -qarch=qp -qtune=qp
+            -qmaxmem=-1 -qsimd=noauto -qreport -qhot)
+    elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL "bgp")
+        target_compile_options(ross PRIVATE -qflag=i:i -qattr=full -O5)
+        # Legacy -qtune=450 -qarch=450d preserved in OPTIONS for historical reasons
+    elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL "bgl")
+        target_compile_options(ross PRIVATE -qflag=i:i -qattr=full -O5)
     endif()
 endif()
 ```
-Same for BGQ, BGP. Keep generic `-D_GNU_SOURCE` as a target compile definition: `target_compile_definitions(ross PRIVATE _GNU_SOURCE)`.
 
-**Also delete the dead `CXX_FLAGS` assignment bug** at [CMakeLists.txt:117](CMakeLists.txt#L117) and [:124](CMakeLists.txt#L124):
+   `MATCHES "^XL"` covers both `"XL"` and `"XLClang"`. The `message(STATUS ...)` is load-bearing: if anyone ever does build on real XL hardware again, the status line tells us they hit a long-untested path so the result can be reported.
+
+4. **Gate the BGQ-specific `USE_BGPM` option + `imp_bgpm` IMPORTED target** at [CMakeLists.txt:94-97](CMakeLists.txt#L94-L97) on the same `(bgq AND XL)` predicate. The IMPORTED target hardcodes `/bgsys/drivers/ppcfloor/bgpm/lib/libbgpm.a` which only exists on BGQ login nodes; applying the block outside BGQ is broken today. Conservative call is to gate it; deletion is tracked in future-refactor-tasks.md.
+
+5. **Delete the dead `CXX_FLAGS` assignment bug** at [CMakeLists.txt:117](CMakeLists.txt#L117) and [:124](CMakeLists.txt#L124):
 ```cmake
 # BOTH OF THESE ARE NONSENSE — CXX isn't an enabled language:
 SET(CMAKE_CXX_FLAGS "${CMAKE_C_FLAGS}")   # in x86_64 branch
 SET(CMAKE_CXX_FLAGS "${CMAKE_C_FLAGS}")   # in aarch64 branch
 ```
-They look like a copy-paste mangling of a C-flags append and currently no-op. Delete outright rather than "fixing" them — the x86_64/aarch64 branches don't need any arch-specific C flags beyond `-D_GNU_SOURCE`, which becomes a target compile definition anyway.
+   Delete outright — copy-paste mangling that has been a silent no-op. The x86_64/aarch64 branches need only the generic flags from step 2 above.
 
-**Why**: applying `-O5 -qarch=pwr9` to ppc64le with gcc/clang is broken. Also avoids polluting parent project flags when ROSS is added via `add_subdirectory`.
+**Why this gating fix is strictly safer than the status quo**:
+- On non-PPC systems (x86_64, aarch64, armv7l): no behavior change. Generic flags only.
+- On ppc64le with gcc: today this is *broken* (`-qarch=pwr9` injected into gcc). After this step it builds correctly with generic flags only.
+- On ppc64le with IBM XL: same flags as today, no regression. Status message appears.
+- On BGQ/BGP/BGL with anything: dormant code. No one has the hardware to find out either way.
+
+**Why we don't delete BGQ/BGP/BGL outright**: they're EOL hardware (Mira retired 2019, Sequoia 2020, BGP/BGL even earlier), but the deletion isn't testable. Gated-and-dormant code costs nothing and leaves a path for archeology. If someone confirms zero surviving builds, deletion is a one-PR follow-up.
 
 ---
 
@@ -601,18 +863,20 @@ endif()
 
 ## Sequencing recommendation
 
-- **Phase 0 (pre-flight)**: Step 0 (disable Damaris/RISA). Land first, in its own PR.
-- **Phase 1 (export story)**: Steps 1, 2, 3, 4, 5, 6, 7, **11**. After phase 1, codes can migrate from pkg-config to `find_package(ross CONFIG REQUIRED)` cleanly. Keep both pkg-config AND CMake config paths working.
+- **PR 1 — Pre-flight CI restoration**: Step CI. Add a minimal GitHub Actions workflow + delete the dead `.travis.yml`. Must be green on `master` before anything else lands. Gives every subsequent PR an automated regression check.
+- **Phase 0 (PR 2 — dead-subsystem deletions)**: Step 0 (disable Damaris/RISA) + Step 0b (remove Coveralls path) + Step 0c (delete `ross-config` shell wrapper). Combined in one PR — all three are independent deletions of dead or redundant infrastructure, all shrink the plan's downstream surface area. Land before Phase 1. Review each as its own commit.
+- **Phase 1 (export story)**: Steps 1, 2, 3, 4, **4b**, 5, 6, 7, **11**. After phase 1, codes can migrate from pkg-config to `find_package(ross REQUIRED)` cleanly. Keep both pkg-config AND CMake config paths working.
 - **Phase 2 (correctness/portability)**: Steps 8, 9, 13, 14.
 - **Phase 3 (polish/dogfood)**: Steps 10, 12, 15, 16.
+- **Post-Phase 3 — Comprehensive CI rebuild**: multi-platform (macOS, multiple Ubuntu versions), multiple MPI implementations (MPICH, OpenMPI), compiler matrix (gcc, clang), coverage (modernized via target-scoped flags + `codecov-action`), CODES integration test. Tracked in [future-refactor-tasks.md](future-refactor-tasks.md) "CI re-establishment (comprehensive)".
 
 Each phase is independently shippable; Phase 1 unblocks the user's stated priority.
 
 **PR granularity within Phase 1**:
 - Steps **2 + 11** must land together — Step 2 deletes `${ROSS_BINARY_DIR}` (via the nested-project removal), which Step 11 replaces with `install(TARGETS ...)`. Splitting them leaves a broken install line referencing an empty variable.
 - Steps **3 / 5 / 6 / 7** must also land together (separate commits are fine for review). Step 3's `INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/ross` commits to the Step 6 install layout, and Step 7's pkg-config `includedir` must match both. Splitting them across PRs produces intermediate states where the exported target points at an include dir that doesn't exist yet.
-- Steps 1 and 4 can each go in their own PR.
-- Pragmatic option: bundle the entire Phase 1 (Steps 1, 2, 3, 4, 5, 6, 7, 11) into a single PR with one commit per step. The interdependencies are tight enough that staged review across multiple PRs costs more than it gains.
+- Steps 1, 4, and 4b can each go in their own PR (Step 4b is fully independent — only touches the `add_library` site and CLAUDE.md).
+- Pragmatic option: bundle the entire Phase 1 (Steps 1, 2, 3, 4, 4b, 5, 6, 7, 11) into a single PR with one commit per step. The interdependencies are tight enough that staged review across multiple PRs costs more than it gains.
 
 ## Validation strategy
 
@@ -627,13 +891,70 @@ After each step, validate by:
    ```cmake
    cmake_minimum_required(VERSION 3.21)
    project(test_ross_consumer C)
-   find_package(ross CONFIG REQUIRED)
+   find_package(ross REQUIRED)
    add_executable(t main.c)
    target_link_libraries(t PRIVATE ross::ross)
    ```
    Configure with `-Dross_DIR=<prefix>/lib/cmake/ross`. Building from a non-sibling dir catches hidden `${CMAKE_CURRENT_SOURCE_DIR}`/`${PROJECT_SOURCE_DIR}` assumptions that pass when the consumer is adjacent to the source.
 4. Build codes against the new install and confirm pkg-config flow still works (Phase 1 should be backward-compatible).
 5. Spot-check version regression: after Step 1, configure in a copy of the source with `.git/` deleted — build should succeed with `0.0.0` fallback, not error.
+6. **MPI auto-discovery regression**: after Step 4, configure ROSS in a shell with `CC` and `CXX` unset (`env -u CC -u CXX cmake --preset ross-debug`). This must succeed without anyone setting `-DCMAKE_C_COMPILER=mpicc`. Re-run on both macOS (Homebrew MPICH) and a Linux box (system OpenMPI or MPICH via `module load`) before merging. If `find_package(MPI)` can't locate MPI without the wrapper-compiler hint on a supported platform, that's a configure-UX regression and Step 4 needs more attention before Phase 1 ships.
+7. **PPC validation (Phase 2, when accessible)**: after Step 13 lands, ask someone with PPC system access (e.g., one of Chris's students at RPI) to run `cmake --preset ross-debug && cmake --build --preset ross-debug` with the default system compiler — almost certainly gcc on a Power9/Power10. Build must succeed with generic flags only; no `-qarch=pwr9` errors from gcc. This validates that the XL-gating actually keeps the bad flags away from non-XL compilers. If the system also has IBM XL installed, repeat there to confirm the XL path still applies the optimization flags (untested but unchanged from master). Do **not** gate Phase 2 merge on this — the gating fix is strictly safer than master regardless of whether anyone runs the validation. BGQ/BGP/BGL paths are not testable (no surviving hardware in active use).
+
+---
+
+## Rollback and cross-repo coordination
+
+Phase 1 changes the ROSS install layout (header paths, package config location, library filename). Even with the back-compat preservation built into the plan (`ross.pc` kept working, uppercase shim, `${ROSS_INCLUDE_DIRS}` derived in the shim, Path B header contract matching what CODES already does), the change is cross-repo by nature — ROSS's install tree is read by CODES. This section lays out the order of operations and what to do if something breaks.
+
+### Why the blast radius is small
+
+By design, Phase 1 preserves both supported discovery surfaces:
+- **pkg-config users** (CODES today): `ross.pc` updated in Step 7 but still produces the same kind of output (`-L`/`-I`/`-l` flags). CODES's `pkg_check_modules(ROSS ... ross)` keeps working. `${ROSS_INCLUDE_DIRS}` and `PkgConfig::ROSS` keep being populated from pkg-config output.
+- **legacy `find_package(ROSS)` users** (hypothetical external researchers): the uppercase shim at `<prefix>/lib/ROSSConfig.cmake` catches the old discovery path, sets `ROSS_INCLUDE_DIRS` via `get_target_property` to match master's behavior, and aliases the bare `ROSS` target to `ross::ross`.
+
+So the realistic breakage modes are narrow: header path collisions (something CODES `#include`'d at `<foo.h>` that's now under `<ross/foo.h>` — but Path B guarantees `<ross.h>` and any `<ross-*.h>` keep resolving), platform-specific MPI detection differences, or a missed `${ROSS_*_DIR}` reference inside a step.
+
+### Order of operations
+
+1. **Land PR 1 (CI restoration) and Phase 0 (PR 2 — Damaris + Coveralls + ross-config deletions) on ROSS master first.** Both are independent of CODES.
+2. **Before merging Phase 1, build CODES locally against the Phase 1 install.** The plan's validation strategy already covers this; the timing is "pre-merge," not "post-merge." Concretely:
+   - Build ROSS from the `cmake-improvements` branch, install to `install/debug`.
+   - In CODES: `rm -rf build/debug` (or `cmake --fresh`) to clear the cached `pkgcfg_lib_ROSS_ROSS:FILEPATH=...libROSS.a` entry that points at the old library filename.
+   - Reconfigure and build CODES. Run its test suite. Iterate on whichever side breaks.
+3. **Merge Phase 1 only after CODES builds clean.** This is the cheap-coordination version of a contract test (the real one is post-Phase-3 — see [future-refactor-tasks.md](future-refactor-tasks.md) "CODES contract test").
+4. **After ROSS Phase 1 lands**, CODES users (just you for now) need to `cmake --fresh` or delete their CODES build directory once to flush the stale pkg-config cache. The first reconfigure picks up the new library name (`libross.{a,so}`) and new include path (`<prefix>/include/ross/`).
+
+### If CODES breaks anyway
+
+Three options, in order of preference:
+
+1. **Fix the consumer side.** Most likely root cause if the break is real — e.g., CODES has a stray `#include <buddy.h>` reaching for an internal header that's no longer installed, or a hardcoded library path in a CODES CMakeLists.txt. Fix CODES, push to its master, done. ROSS doesn't need to revert.
+2. **Pin CODES to a pre-Phase-1 ROSS commit temporarily.** If the CODES-side fix is non-trivial and the immediate priority is "unblock other work," CODES can specify an exact ROSS install path (`ROSS_PKG_CONFIG_PATH=<old-install>/lib/pkgconfig`) until the proper fix lands. Use sparingly — it's a workaround, not a solution.
+3. **Revert the ROSS PR.** Last resort, only if Phase 1 turns out to have a fundamental design flaw that isn't fixable in a follow-up. Because Phase 1 should land as a single PR with one commit per step (per the sequencing recommendation), revert is one `git revert <merge-commit>` on ROSS master. CODES sees the old install layout again on next reconfigure, no CODES change required.
+
+### Bundle Phase 1 into one PR
+
+This matters specifically for rollback: a single Phase 1 PR with one commit per step is **one** revertible unit. Splitting Phase 1 across multiple PRs would mean reverting in inverse order, which is more annoying but still works (each step is independently revertible).
+
+The Sequencing section above already recommends bundling Phase 1 into one PR with commits per step. The rollback ergonomics are one of the reasons.
+
+### What this does NOT need
+
+This isn't a microservices deploy with rolling cutover and canary stages. It's three personal repos on one workstation. The "rollback story" boils down to: validate manually, merge, observe, revert if needed. No release flags, no migration window, no coordinated cut-over. The contract test (post-Phase-3) is what graduates this from "manual local validation" to "CI catches regressions automatically" — until then, the human-in-the-loop step is acceptable for the volume of work involved.
+
+---
+
+## Out of scope
+
+Cleanup work that's been identified during this refactor but is deliberately not in scope for the `cmake-improvements` branch is tracked in [future-refactor-tasks.md](future-refactor-tasks.md). At time of writing that covers:
+
+- Extern-declaration / definition-file mismatches across `core/*.h`
+- Public/private header split (stop installing internal-only headers like `buddy.h`, `lz4.h`, `hash-quadratic.h`, queue/clock/gvt implementation headers, etc.)
+- Source-tree restructure to `core/include/ross/` + `core/src/` so build-tree and install-tree layouts become identical
+- Tightening the consumer contract from Path B (`<ross.h>` plus top-level `ross-*.h`) to Path A (`<ross.h>` only)
+
+If a scope-creep candidate surfaces while implementing the plan, add a section to `future-refactor-tasks.md` rather than expanding the PR.
 
 ---
 
@@ -644,5 +965,5 @@ After each step, validate by:
 - `core/ROSSConfig.cmake` (delete/replace)
 - `core/cmake/rossConfig.cmake.in` (new file)
 - `core/ross.pc.in`
-- `core/ross-config.in` — shell-script wrapper (analogous to `mpicc`/`pkg-config`). Not covered by any step above. If pkg-config + CMake config are the two supported discovery surfaces going forward, this is a deletion candidate. If it's kept, it needs the same `GNUInstallDirs`-derived paths as the other installed artifacts. Decide before merging Phase 1.
+- `core/ross-config.in` — deleted in Step 0c. Was a hand-rolled shell-script discovery wrapper redundant with pkg-config and `find_package(ross)`. Grep across CODES / NetMaestro confirmed no callers.
 - `models/CMakeLists.txt` and `models/phold/CMakeLists.txt` (Phase 3 dogfooding)
