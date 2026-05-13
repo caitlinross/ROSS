@@ -58,8 +58,9 @@ GET_FILENAME_COMPONENT(ROSS_INCLUDE_DIRS "${SELF_DIR}/../include" ABSOLUTE)
 
 ### 1e. `CMakePresets.json`
 
-- Declares `cmakeMinimumRequired` 3.28.1, which contradicts the `cmake_minimum_required(VERSION 3.5)` in the source. The presets file is fine but reveals the project actually targets a much newer CMake.
-- `binaryDir: ${sourceDir}/build/debug` — in-source-adjacent build (under the source tree). Combined with the model `GLOB_RECURSE`, this is a footgun.
+- **Note**: this file was committed by accident on the `cmake-improvements` branch (commit `6581ba2d`) — it was personal scaffolding that should have been `CMakeUserPresets.json` (gitignored). It does NOT exist on master and will be removed from the branch before any PR opens (see Step 0d). The observations below describe the file's content while it's still present on this branch; once Step 0d lands the section becomes historical.
+- Declares `cmakeMinimumRequired` 3.28.1, which contradicts the `cmake_minimum_required(VERSION 3.5)` in the source. The contradiction goes away when the file is removed; only the source-side `3.5` problem remains, addressed by Step 1.
+- `binaryDir: ${sourceDir}/build/debug` — in-source-adjacent build (under the source tree). Combined with the model `GLOB_RECURSE`, this is a footgun. The developer's local `CMakeUserPresets.json` can keep this layout if they prefer; Step 10 fixes the glob so it stops mattering.
 
 ### 1f. CMake module dir (`core/cmake/`)
 
@@ -102,7 +103,7 @@ From `/Users/caitlin.ross/projects/digital-twin/software/codes/CMakeLists.txt`:
 | P2 | Exported target leaks absolute MPI paths into `INTERFACE_INCLUDE_DIRECTORIES`/`INTERFACE_LINK_LIBRARIES` → not relocatable | High |
 | P3 | Bare target name `ROSS`, no namespace alias | High |
 | P4 | Headers installed flat into `<prefix>/include/` — pollutes consumer include namespace (lz4.h, buddy.h, config.h, io.h, etc.) | High |
-| P5 | `cmake_minimum_required(VERSION 3.5)` but presets require 3.28.1 — inconsistent and blocks modern features | Medium |
+| P5 | `cmake_minimum_required(VERSION 3.5)` is too old — blocks modern features (target-based MPI, `PROJECT_IS_TOP_LEVEL`, etc.). (The original "inconsistent with presets" framing went away with Step 0d: the committed `CMakePresets.json` was personal scaffolding, removed before any PR opens.) | Medium |
 | P6 | Plain (non-keyword) `target_link_libraries` signature on `ROSS` | Medium |
 | P7 | Nested `project()` in `core/` | Medium |
 | P8 | No `include(GNUInstallDirs)`; install destinations are hard-coded `lib`, `bin`, `include` (not `${CMAKE_INSTALL_LIBDIR}` etc.) | Medium |
@@ -159,15 +160,19 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y mpich libmpich-dev
       - name: Configure
-        run: cmake -S . -B build -DROSS_BUILD_MODELS=ON -DCMAKE_BUILD_TYPE=Debug
+        run: cmake -S . -B build -DROSS_BUILD_MODELS=ON -DCMAKE_BUILD_TYPE=Debug -DCMAKE_INSTALL_PREFIX=$PWD/install
       - name: Build
         run: cmake --build build -j
       - name: Test
         run: ctest --test-dir build --output-on-failure
+      - name: Install
+        run: cmake --install build
 ```
 
+The `Install` step is load-bearing for the CMake modernization, not just hygiene: Phase 1 (PR 6) restructures the install tree — header layout, library filename, package config location, pkg-config contents. Everything that's actually under change-management pressure runs at `cmake --install` time, not at build or test time. Without an install step in CI, a regression in `install(EXPORT ...)`, header destination, or `ross.pc` generation goes undetected until someone manually installs and notices CODES broke. Setting `CMAKE_INSTALL_PREFIX` to a workspace-local path keeps the install confined to the runner's checkout.
+
 3. **Verify green on `master`** before starting any CMake work. If master doesn't pass, fix master first (probably small Trusty-era assumptions surfaced by Ubuntu 24.04).
-4. **After Phase 1 lands**, update the workflow's `Configure` step to use `cmake --preset ross-debug` instead of manual flags. One-line change.
+4. The manual `cmake -S . -B build -D...` form is the permanent shape of the CI invocation. No preset migration follow-up — there is no `CMakePresets.json` in the tree (see Step 0d). The committed `CMakePresets.json` on the `cmake-improvements` branch was personal scaffolding and is removed in PR 2.
 
 **Why minimal scope here**: this PR is a regression-detection enabler, not the comprehensive CI rebuild. Adding macOS, OpenMPI, compiler matrix, and coverage now would balloon the PR and delay the actual CMake work. Each of those is a small follow-up PR after the CMake refactor lands.
 
@@ -242,6 +247,29 @@ It is fully redundant with the two discovery surfaces this plan establishes:
 **Why**: dead infrastructure with two modern replacements already in scope. Carrying a third discovery surface (`ross-config`) through the modernization means three things to keep in sync. Deleting it now removes a per-PR maintenance cost from every subsequent step.
 
 **Compat**: any consumer script that previously called `ross-config --cflags` etc. would break — but the grep across CODES / NetMaestro / ROSS itself confirmed zero such callers. If a surprise out-of-tree consumer turns up post-merge, the migration is `pkg-config --cflags ross` (literally one word swap).
+
+---
+
+### Step 0d — Pre-flight: remove the committed `CMakePresets.json`
+
+**Files**: delete `CMakePresets.json` (added in commit `6581ba2d` on this branch — never landed on master)
+
+**Context**: `CMakePresets.json` was committed during early `cmake-improvements` work as personal scaffolding (`ross-debug` / `ross-release` presets pointing at the developer's local `install/debug` / `install/release` paths). It should have been `CMakeUserPresets.json` — the standard CMake convention for personal, machine-specific presets that should *not* be checked in. The user's `.gitignore` already excludes `CMakeUserPresets.json`; this commit slipped a `CMakePresets.json` in by name mismatch.
+
+Removing it (vs. polishing it for upstream consumption) is the right call: there's no project-wide preset that would suit everyone, the file currently encodes one developer's directory layout, and the manual `cmake -S . -B build -D...` invocation is the universal form that works for CI and for anyone without a personal preset file.
+
+**Changes**:
+1. `git rm CMakePresets.json` on the `cmake-improvements` branch before any PR against master opens. The file lives only on this branch (`git branch --contains 6581ba2d` returns `cmake-improvements` only), so removal is a one-commit cleanup with no master-side impact.
+2. The developer keeps a local `CMakeUserPresets.json` (gitignored, never committed) with the same `ross-debug` / `ross-release` content. `cmake --preset ross-debug` continues to work for them; nothing changes about the personal workflow.
+3. CI uses manual flags already (see PR 1's `.github/workflows/build.yml`) — unaffected.
+
+**Implication for Step 1**: the top-level `cmake_minimum_required` is now driven purely by the project's own needs (3.21 for `PROJECT_IS_TOP_LEVEL`, per Step 1), not by any tension with a committed preset's `cmakeMinimumRequired: 3.28.1`. **P5 in the Part 3 table loses its "inconsistent with presets" framing** — only the "3.5 is too old, blocks modern features" half remains, and Step 1 already addresses it. Step 16 (which existed to reconcile the two minimums) becomes moot.
+
+**Implication for plan/checklist prose**: `cmake --preset ross-debug` / `cmake --preset ross-release` invocations sprinkled through the plan's validation steps continue to work for the developer (against their local `CMakeUserPresets.json`). Anyone else reading the plan should treat those as shorthand for the equivalent manual `cmake -S . -B build -DROSS_BUILD_MODELS=ON -DCMAKE_BUILD_TYPE=Debug -DCMAKE_INSTALL_PREFIX=...` invocation. No further plan-wide rewrite needed.
+
+**Compat**: no impact on CODES or NetMaestro — `CMakePresets.json` was never installed, never exported, never referenced outside the repo.
+
+**Sequencing**: do this in the same PR as Phase 0 (PR 2 — Damaris + Coveralls + ross-config deletions). Same theme (remove infra that shouldn't have shipped), one extra commit. Alternatively, land it as its own tiny pre-PR if Phase 0 isn't ready yet — it's strictly independent.
 
 ---
 
@@ -474,8 +502,7 @@ install(EXPORT rossTargets
 configure_package_config_file(
     ${CMAKE_CURRENT_SOURCE_DIR}/cmake/rossConfig.cmake.in
     ${CMAKE_CURRENT_BINARY_DIR}/rossConfig.cmake
-    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/ross
-    PATH_VARS CMAKE_INSTALL_INCLUDEDIR)
+    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/ross)
 
 write_basic_package_version_file(
     ${CMAKE_CURRENT_BINARY_DIR}/rossConfigVersion.cmake
@@ -690,6 +717,8 @@ endforeach()
 ```
 Explicit listing is preferred — there are only 1-2 models in tree.
 
+**Also delete the orphaned `cmake_policy(SET CMP0009 NEW)` line** at [models/CMakeLists.txt:56](models/CMakeLists.txt#L56). It exists only to make the now-deleted `FILE(GLOB_RECURSE ... FOLLOW_SYMLINKS)` follow symlinks. With the glob gone, the policy line has no remaining caller and should be removed alongside it.
+
 **Why**: globs miss new files until reconfigure, and `GLOB_RECURSE` following symlinks is a footgun if a model ever contains a nested build dir. The build dir hazard is modest in practice (the preset's build dir is at `ross/build/`, not `ross/models/build/`), but explicit `add_subdirectory` is clearer and cheaper to maintain.
 
 ---
@@ -744,6 +773,15 @@ add_test(NAME ${target_name}_SCHED_Optimistic
 ```
 
 **Why**: respects whatever MPI was found (mpich vs openmpi vs slurm srun); works on systems without `mpirun` in PATH. Generator expressions also make the test location-independent (no more implicit CWD dependency from `./${target_name}`).
+
+**Sequential tests don't use mpirun** — `_SCHED_Sequential`, `_SCHED_OptDebug`, `_SCHED_RollbackCheck` (and `_INST_Seq`) run the binary directly. Use the bare `$<TARGET_FILE:${target_name}>` form for these, without the `${MPIEXEC_*}` prefix:
+
+```cmake
+add_test(NAME ${target_name}_SCHED_Sequential
+         COMMAND $<TARGET_FILE:${target_name}> --synch=1)
+```
+
+Mixing `${MPIEXEC_EXECUTABLE}` into the sequential cases would launch them under MPI for no reason and break the `--synch=1`/`--synch=4`/`--synch=6` single-rank contract that `--synch=6` (rollback-check) and `--synch=4` (optimistic debug) depend on.
 
 **Note**: the positional `ADD_TEST` form does *not* expand generator expressions, so changing the signature is a prerequisite, not an optional cleanup.
 
@@ -810,6 +848,8 @@ SET(CMAKE_CXX_FLAGS "${CMAKE_C_FLAGS}")   # in aarch64 branch
 - On ppc64le with IBM XL: same flags as today, no regression. Status message appears.
 - On BGQ/BGP/BGL with anything: dormant code. No one has the hardware to find out either way.
 
+**How the compiler choice happens**: on Power HPC systems (Summit-era OLCF, AC922/Power9-Power10 boxes), users select the compiler at the user level — typically `module load xl/...` or `module load gcc/...`, or by setting `CC=xlc` / `CC=gcc` in the environment. CMake doesn't expose a "use XL" option; instead, after Step 4's `find_package(MPI)` discovers `mpicc` and inspects the underlying compiler, `CMAKE_C_COMPILER_ID` is set to `XL` / `XLClang` / `GNU` accordingly, and the gating block below applies XL flags only when an XL family compiler is detected. So "XL is the default on PPC" is true for users who `module load xl` before configuring — they get exactly the same XL-tuned binary they get today. Users who `module load gcc` get a working build with the standard `CMAKE_BUILD_TYPE`-driven optimization (e.g., `-O3` for `Release`), which today's master can't produce at all.
+
 **Why we don't delete BGQ/BGP/BGL outright**: they're EOL hardware (Mira retired 2019, Sequoia 2020, BGP/BGL even earlier), but the deletion isn't testable. Gated-and-dormant code costs nothing and leaves a path for archeology. If someone confirms zero surviving builds, deletion is a one-PR follow-up.
 
 ---
@@ -830,53 +870,90 @@ target_compile_definitions(ross PRIVATE ROSS_OPTION_LIST="${OPTIONS}")
 
 ### Step 15 — Normalize option names with `ROSS_` prefix
 
-**File**: top-level + `core/CMakeLists.txt`
+**Files**: top-level `CMakeLists.txt`, `core/CMakeLists.txt`, `core/config.h.in` (does NOT need to change — see below)
 
-**Change**: rename for consistency (keep old as deprecated aliases via `option()` + `if(DEFINED OLDNAME) ...`):
-- `AVL_TREE` → `ROSS_USE_AVL_TREE`
-- `USE_RIO` → `ROSS_USE_RIO`
-- `USE_DAMARIS` → `ROSS_USE_DAMARIS`
-- `USE_RAND_TIEBREAKER` → `ROSS_USE_RAND_TIEBREAKER`
-- `RAND_NORMAL` → `ROSS_RAND_NORMAL`
-- `COVERALLS` → `ROSS_COVERALLS`
-- `USE_BGPM` → `ROSS_USE_BGPM`
+**Scope clarification — this is a CMake-cache rename only, not a C-source rename.** The option names below appear in three places:
 
-**Why**: avoids name collisions in superbuilds (`USE_RIO` and `RAND_NORMAL` are very generic). Make this step optional / low priority — only do it if you're willing to do a one-time consumer-facing rename.
+1. **CMake `option(...)` declarations** at the top-level and in `core/CMakeLists.txt`. These are the user-facing knobs; this step renames them.
+2. **`core/config.h.in` `#cmakedefine` directives** ([core/config.h.in:12-20](core/config.h.in#L12-L20)). These translate the CMake variable into a C preprocessor macro of the same name in the generated `config.h`.
+3. **`#ifdef ...` sites in C code.** `tw-setup.c`, `tw-event.c`, `tw-pe.c`, `ross-types.h`, `ross-gvt-internal.h`, etc. — 40+ `#ifdef USE_RIO`, `#ifdef AVL_TREE`, `#ifdef USE_RAND_TIEBREAKER`, etc.
 
-**Compat**: provide a one-release deprecation shim:
+Renaming all three would force a churn-heavy C-side diff (touching every `#ifdef`). The pragmatic call is to rename the CMake layer only — what users discover with `ccmake` / `cmake -L` — and bridge to the C-side via a CMake-to-CMake variable copy *before* `configure_file(config.h.in config.h)` runs. The C sources stay on the historical macro names (`USE_RIO`, `AVL_TREE`, …) indefinitely; only the CMake knob changes.
+
+**Changes**:
+
+1. Rename the `option(...)` declarations:
+   - `AVL_TREE` → `ROSS_USE_AVL_TREE`
+   - `USE_RIO` → `ROSS_USE_RIO`
+   - `USE_DAMARIS` → `ROSS_USE_DAMARIS`
+   - `USE_RAND_TIEBREAKER` → `ROSS_USE_RAND_TIEBREAKER`
+   - `RAND_NORMAL` → `ROSS_RAND_NORMAL`
+   - `COVERALLS` → `ROSS_COVERALLS` (moot if Step 0b lands first — included for completeness)
+   - `USE_BGPM` → `ROSS_USE_BGPM`
+
+2. Update every internal CMake reference to use the new name (e.g., `if(ROSS_USE_RIO)` not `if(USE_RIO)`, and the `if(AVL_TREE) set(ross_srcs ${ross_srcs} avl_tree.h avl_tree.c) endif()` block in `core/CMakeLists.txt`).
+
+3. **Bridge to `config.h.in`**: immediately before `configure_file(config.h.in config.h)` in `core/CMakeLists.txt`, copy the new variable back into the old name so the existing `#cmakedefine USE_RIO` / `#cmakedefine AVL_TREE` / etc. directives still resolve. This keeps the generated `config.h` byte-identical to today's output and avoids touching any C source:
+   ```cmake
+   # Bridge new CMake option names to the legacy macro names that config.h.in
+   # and the C sources reference. Renaming the macros across the C tree is a
+   # separate concern from the CMake-knob rename; this shim keeps them aligned.
+   set(USE_RIO              ${ROSS_USE_RIO})
+   set(AVL_TREE             ${ROSS_USE_AVL_TREE})
+   set(USE_DAMARIS          ${ROSS_USE_DAMARIS})
+   set(USE_RAND_TIEBREAKER  ${ROSS_USE_RAND_TIEBREAKER})
+   set(RAND_NORMAL          ${ROSS_RAND_NORMAL})
+   set(USE_BGPM             ${ROSS_USE_BGPM})
+   ```
+   Do NOT modify `config.h.in` itself — the `#cmakedefine` names stay aligned with the `#ifdef` sites in `core/*.c` and `core/*.h`. A future PR can rename the C-side macros in a separate, mechanical sweep (and at that point this bridge block disappears).
+
+4. **Deprecation shim for old user-facing knobs** — one-release back-compat for invocations like `-DUSE_RIO=ON`:
 ```cmake
 if(DEFINED USE_RIO AND NOT DEFINED ROSS_USE_RIO)
     message(DEPRECATION "USE_RIO is deprecated; set ROSS_USE_RIO instead")
-    set(ROSS_USE_RIO ${USE_RIO})
+    set(ROSS_USE_RIO ${USE_RIO} CACHE BOOL "" FORCE)
 endif()
 ```
+   Repeat for each renamed option. Remove the shims after a soak period (tracked in [future-refactor-tasks.md](future-refactor-tasks.md) "Deprecation shim removals").
+
+**Why**: avoids name collisions in superbuilds (`USE_RIO` and `RAND_NORMAL` are very generic). Make this step optional / low priority — only do it if you're willing to do a one-time consumer-facing rename. The CMake-only rename keeps the diff small (option declarations, internal `if()` references, one bridge block, one deprecation shim per option) and explicitly defers the C-side `#ifdef` rename to a follow-up.
+
+**Compat**: existing `-DUSE_RIO=ON`-style invocations keep working through the deprecation shim. Generated `config.h` is unchanged because the bridge block re-exports the old names before `configure_file` runs. No C source changes.
 
 ---
 
-### Step 16 — Bump preset minimum to match top-level
+### Step 16 — REMOVED
 
-**File**: `CMakePresets.json`
+**Status**: moot. This step originally aligned `CMakePresets.json`'s `cmakeMinimumRequired` (3.28.1) with the top-level CMake minimum. Step 0d removes the committed `CMakePresets.json` entirely (it was personal scaffolding that should have been `CMakeUserPresets.json`), so there's nothing to align. Top-level `cmake_minimum_required` is set per Step 1 (3.21) without preset-driven pressure.
 
-**Change**: lower the `cmakeMinimumRequired` to 3.21 (matching the new top-level), or leave at 3.28.1 if you want to require modern presets — but make them consistent. Also consider moving `binaryDir` out of `${sourceDir}/build` to avoid in-source-adjacent layout (e.g., `${sourceDir}/../ross-build/${presetName}`), which makes the model-glob issue moot.
+The original "move `binaryDir` out of `${sourceDir}/build`" suggestion was a Phase-3 polish concern motivated by the in-source-adjacent layout `${sourceDir}/build/debug` paired with the model `FILE(GLOB_RECURSE)`. Step 10 fixes the glob, and the developer's local `CMakeUserPresets.json` is theirs to lay out however they want. No upstream action.
 
 ---
 
 ## Sequencing recommendation
 
 - **PR 1 — Pre-flight CI restoration**: Step CI. Add a minimal GitHub Actions workflow + delete the dead `.travis.yml`. Must be green on `master` before anything else lands. Gives every subsequent PR an automated regression check.
-- **Phase 0 (PR 2 — dead-subsystem deletions)**: Step 0 (disable Damaris/RISA) + Step 0b (remove Coveralls path) + Step 0c (delete `ross-config` shell wrapper). Combined in one PR — all three are independent deletions of dead or redundant infrastructure, all shrink the plan's downstream surface area. Land before Phase 1. Review each as its own commit.
-- **Phase 1 (export story)**: Steps 1, 2, 3, 4, **4b**, 5, 6, 7, **11**. After phase 1, codes can migrate from pkg-config to `find_package(ross REQUIRED)` cleanly. Keep both pkg-config AND CMake config paths working.
-- **Phase 2 (correctness/portability)**: Steps 8, 9, 13, 14.
-- **Phase 3 (polish/dogfood)**: Steps 10, 12, 15, 16.
+- **PR 2 — Phase 0, dead-subsystem deletions**: Step 0 (disable Damaris/RISA) + Step 0b (remove Coveralls path) + Step 0c (delete `ross-config` shell wrapper) + Step 0d (remove the committed `CMakePresets.json`). Combined in one PR — all four are independent deletions of dead, redundant, or personal-scaffolding infrastructure, all shrink the plan's downstream surface area. Land before Phase 1. Review each as its own commit.
+- **PR 3 — Step 1 (CMake-minimum + project VERSION)**: independent, no install-layout impact. Bumps `cmake_minimum_required` to 3.21, drives `project(... VERSION)` from `git_describe_working_tree` with the `0.0.0` fallback for tarballs.
+- **PR 4 — Step 4 (MPI auto-discovery via `MPI::MPI_C`)**: independent. Deletes `SetupMPI.cmake`, switches to `find_package(MPI REQUIRED COMPONENTS C)`, target-scopes the MPI dep. Most user-visible UX change — `cmake --preset ross-debug` works without `CC=mpicc`. Wants its own dedicated validation pass on macOS + Linux.
+- **PR 5 — Step 4b (`BUILD_SHARED_LIBS`)**: independent, tiny. Retires `ROSS_BUILD_SHARED_LIBS`, adds the deprecation shim. Only touches `core/CMakeLists.txt` (`add_library` site) and CLAUDE.md.
+- **PR 6 — Phase 1 export bundle**: Steps **2, 3, 5, 6, 7, 11**. This is the heart of the migration — nested-project removal, target rename to `ross::ross`, `BUILD/INSTALL_INTERFACE` include dirs, `rossConfig.cmake` + version file + uppercase shim, header reorg under `include/ross/`, modernized `ross.pc`, model dogfooding. These are tightly interdependent (see "Inter-step dependencies inside PR 6" below) and ship as one PR with one commit per step. After this lands, codes can migrate from pkg-config to `find_package(ross REQUIRED)` cleanly.
+- **Phase 2 (correctness/portability)**: Steps 8, 9, 13, 14. Each can be its own PR.
+- **Phase 3 (polish/dogfood)**: Steps 10, 12, 15. (Step 16 was removed — see Step 0d.) Each can be its own PR.
 - **Post-Phase 3 — Comprehensive CI rebuild**: multi-platform (macOS, multiple Ubuntu versions), multiple MPI implementations (MPICH, OpenMPI), compiler matrix (gcc, clang), coverage (modernized via target-scoped flags + `codecov-action`), CODES integration test. Tracked in [future-refactor-tasks.md](future-refactor-tasks.md) "CI re-establishment (comprehensive)".
 
-Each phase is independently shippable; Phase 1 unblocks the user's stated priority.
+PR 6 is what unblocks the user's stated priority (CODES via `find_package(ross)`). PRs 3/4/5 are deliberately split off so PR 6's review surface is narrow — just the export-contract changes, not also "we bumped CMake" and "we changed MPI discovery" and "we renamed a build option."
 
-**PR granularity within Phase 1**:
+**Inter-step dependencies inside PR 6**:
 - Steps **2 + 11** must land together — Step 2 deletes `${ROSS_BINARY_DIR}` (via the nested-project removal), which Step 11 replaces with `install(TARGETS ...)`. Splitting them leaves a broken install line referencing an empty variable.
 - Steps **3 / 5 / 6 / 7** must also land together (separate commits are fine for review). Step 3's `INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/ross` commits to the Step 6 install layout, and Step 7's pkg-config `includedir` must match both. Splitting them across PRs produces intermediate states where the exported target points at an include dir that doesn't exist yet.
-- Steps 1, 4, and 4b can each go in their own PR (Step 4b is fully independent — only touches the `add_library` site and CLAUDE.md).
-- Pragmatic option: bundle the entire Phase 1 (Steps 1, 2, 3, 4, 4b, 5, 6, 7, 11) into a single PR with one commit per step. The interdependencies are tight enough that staged review across multiple PRs costs more than it gains.
+- Order within PR 6: 2 → 11 → 3 → 5 → 6 → 7 as separate commits gives reviewers a coherent narrative (target rename → install fix → interface dirs → CMake config → header layout → pkg-config alignment).
+
+**Why this beats the earlier "bundle all of Phase 1" framing**:
+- PRs 3/4/5 are each ~1-file changes that can ship in days, not weeks. They de-risk PR 6 by getting infrastructure-level work out of the way first.
+- PR 6's diff is smaller and the review surface is focused entirely on "consumer-facing export contract." Reviewers don't have to context-switch between unrelated concerns.
+- Step 4 (MPI) needs its own validation matrix (macOS Homebrew MPICH + Linux system MPI) — gating PR 6 on that validation would slow down the export work for no reason.
+- The single-revert rollback story is preserved for PR 6 specifically: revert PR 6 and the install layout returns to "after PRs 3/4/5 but before export changes." PRs 3/4/5 are independently revertible if any one of them turns out badly.
 
 ## Validation strategy
 
@@ -925,19 +1002,31 @@ So the realistic breakage modes are narrow: header path collisions (something CO
 3. **Merge Phase 1 only after CODES builds clean.** This is the cheap-coordination version of a contract test (the real one is post-Phase-3 — see [future-refactor-tasks.md](future-refactor-tasks.md) "CODES contract test").
 4. **After ROSS Phase 1 lands**, CODES users (just you for now) need to `cmake --fresh` or delete their CODES build directory once to flush the stale pkg-config cache. The first reconfigure picks up the new library name (`libross.{a,so}`) and new include path (`<prefix>/include/ross/`).
 
+### Why the one-time cache flush is needed (`pkgcfg_lib_ROSS_ROSS`)
+
+When CODES configures, `pkg_check_modules(ROSS REQUIRED IMPORTED_TARGET ross)` shells out to pkg-config, reads `Libs: -L${libdir} -lROSS -lm`, and **resolves each `-l<name>` to an absolute path** by searching the `-L` library dirs. The resolved paths are stored as `FILEPATH` cache entries — e.g. `pkgcfg_lib_ROSS_ROSS:FILEPATH=/Users/.../install/debug/lib/libROSS.a`. `PkgConfig::ROSS`'s `INTERFACE_LINK_LIBRARIES` references those cached absolute paths.
+
+The cache step is a performance optimization — re-running pkg-config + filesystem-resolve on every configure would be expensive. CMake assumes the cached path is still valid on subsequent configures.
+
+PR 6 invalidates that assumption exactly once: Step 2 renames the library file `libROSS.{a,so}` → `libross.{a,so}`, and Step 7 updates `ross.pc` to say `-lross`. After upgrading ROSS, a CODES reconfigure trusts the cached `pkgcfg_lib_ROSS_ROSS:FILEPATH=/.../libROSS.a` entry without re-resolving it, sees the path doesn't point at a file anymore (because `libROSS.a` was replaced by `libross.a`), and either errors at link time or silently falls back to whatever the linker finds on the default library path.
+
+`cmake --fresh` (CMake 3.24+) or `rm -rf <build-dir>` wipes the cache, so the next configure re-runs `pkg_check_modules` from scratch, sees `-lross`, resolves it to `libross.a`, and re-caches with the new path. **One-time only** — future ROSS upgrades on PR 6+ master don't re-trigger this because the filename stays `libross.{a,so}` from then on. Any time an upstream library renames its file, dependents eat one cache flush.
+
+This is the only consumer-side coordination cost in Phase 1, and it's not specific to ROSS's CMake refactor — it's a generic CMake behavior triggered specifically by the library rename in Step 2. Everything else (the namespace, the package config location, the header reorganization under `include/ross/`) is back-compat-preserved or handled by `pkg_check_modules` re-running pkg-config naturally.
+
 ### If CODES breaks anyway
 
 Three options, in order of preference:
 
 1. **Fix the consumer side.** Most likely root cause if the break is real — e.g., CODES has a stray `#include <buddy.h>` reaching for an internal header that's no longer installed, or a hardcoded library path in a CODES CMakeLists.txt. Fix CODES, push to its master, done. ROSS doesn't need to revert.
 2. **Pin CODES to a pre-Phase-1 ROSS commit temporarily.** If the CODES-side fix is non-trivial and the immediate priority is "unblock other work," CODES can specify an exact ROSS install path (`ROSS_PKG_CONFIG_PATH=<old-install>/lib/pkgconfig`) until the proper fix lands. Use sparingly — it's a workaround, not a solution.
-3. **Revert the ROSS PR.** Last resort, only if Phase 1 turns out to have a fundamental design flaw that isn't fixable in a follow-up. Because Phase 1 should land as a single PR with one commit per step (per the sequencing recommendation), revert is one `git revert <merge-commit>` on ROSS master. CODES sees the old install layout again on next reconfigure, no CODES change required.
+3. **Revert the ROSS PR.** Last resort, only if PR 6 turns out to have a fundamental design flaw that isn't fixable in a follow-up. Because PR 6 (the export bundle) lands as a single PR with one commit per step, revert is one `git revert <merge-commit>` on ROSS master. CODES sees the old install layout again on next reconfigure, no CODES change required. PRs 3/4/5 (Steps 1, 4, 4b) stay landed — they're independent of the export contract and don't need reverting to restore CODES compatibility.
 
-### Bundle Phase 1 into one PR
+### Revert granularity
 
-This matters specifically for rollback: a single Phase 1 PR with one commit per step is **one** revertible unit. Splitting Phase 1 across multiple PRs would mean reverting in inverse order, which is more annoying but still works (each step is independently revertible).
+The export-contract changes (Steps 2/3/5/6/7/11) ship as **one** PR with one commit per step, so PR 6 is a single revertible unit if the export bundle turns out badly. The earlier-landing PRs (CI restoration, Phase 0 deletions, Step 1 / Step 4 / Step 4b) are each independently revertible — they don't touch the install layout that CODES depends on, so reverting one of them doesn't help if CODES breaks. If CODES breakage is the symptom, the suspect is PR 6 specifically.
 
-The Sequencing section above already recommends bundling Phase 1 into one PR with commits per step. The rollback ergonomics are one of the reasons.
+The trade-off of this split-vs.-bundle choice: PRs 3/4/5 mean a few extra merge events on master before the export work lands, but each is small and fast to review. PR 6 stays focused on the consumer-facing surface that's actually under change-management pressure.
 
 ### What this does NOT need
 
